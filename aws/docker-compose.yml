@@ -1,0 +1,110 @@
+# =============================================================================
+# Smart Home Hub Platform - Local Development
+# =============================================================================
+# Run: docker-compose up -d
+# 
+# Services:
+#   - Device Service:     http://localhost:8001
+#   - Automation Service: http://localhost:8002
+#   - User Service:       http://localhost:8003
+#   - Analytics Service:  http://localhost:8004
+#   - Swagger UI:         http://localhost:8080
+#   - Adminer (DB UI):    http://localhost:8081
+# =============================================================================
+
+version: "3.8"
+
+services:
+  # ===========================================================================
+  # Database
+  # ===========================================================================
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: smarthome
+      POSTGRES_PASSWORD: localdev123
+      POSTGRES_DB: smarthome
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smarthome"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================================
+  # Microservices
+  # ===========================================================================
+  device-service:
+    build: ./services/device-service
+    ports:
+      - "8001:8001"
+    environment:
+      - DATABASE_URL=postgresql://smarthome:localdev123@postgres:5432/smarthome
+      - AWS_REGION=us-east-1
+      - IOT_ENDPOINT=
+      - DEVICE_EVENTS_QUEUE=
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  automation-service:
+    build: ./services/automation-service
+    ports:
+      - "8002:8002"
+    environment:
+      - DATABASE_URL=postgresql://smarthome:localdev123@postgres:5432/smarthome
+      - AWS_REGION=us-east-1
+      - DEVICE_EVENTS_QUEUE=
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  user-service:
+    build: ./services/user-service
+    ports:
+      - "8003:8003"
+    environment:
+      - DATABASE_URL=postgresql://smarthome:localdev123@postgres:5432/smarthome
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  analytics-service:
+    build: ./services/analytics-service
+    ports:
+      - "8004:8004"
+    environment:
+      - DATABASE_URL=postgresql://smarthome:localdev123@postgres:5432/smarthome
+      - TIMESTREAM_DATABASE=
+      - TIMESTREAM_TABLE=
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ===========================================================================
+  # Development Tools
+  # ===========================================================================
+  swagger-ui:
+    image: swaggerapi/swagger-ui
+    ports:
+      - "8080:8080"
+    environment:
+      - URLS=[
+          {"url":"http://localhost:8001/openapi.json","name":"Device Service"},
+          {"url":"http://localhost:8002/openapi.json","name":"Automation Service"},
+          {"url":"http://localhost:8003/openapi.json","name":"User Service"},
+          {"url":"http://localhost:8004/openapi.json","name":"Analytics Service"}
+        ]
+
+  adminer:
+    image: adminer
+    ports:
+      - "8081:8080"
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:

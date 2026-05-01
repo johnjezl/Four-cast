@@ -1,0 +1,6 @@
+.git
+**/.terraform
+**/*.backup
+**/*.log
+**/*.out
+**/.terraform.lock.hcl
