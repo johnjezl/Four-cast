@@ -70,11 +70,12 @@ resource "aws_lb_listener" "http" {
 resource "aws_lb_target_group" "services" {
   for_each = var.services
 
-  name        = "${var.name_prefix}-${each.key}"
-  port        = each.value.port
-  protocol    = "HTTP"
-  vpc_id      = var.vpc_id
-  target_type = "ip"
+  name                 = "${var.name_prefix}-${each.key}"
+  port                 = each.value.port
+  protocol             = "HTTP"
+  vpc_id               = var.vpc_id
+  target_type          = "ip"
+  deregistration_delay = 30
 
   health_check {
     enabled             = true
