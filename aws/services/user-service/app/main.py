@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import Column
+from sqlalchemy import Column, text
 from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import Field, SQLModel, select
@@ -53,13 +53,13 @@ class User(UserBase, table=True):
     id: str = Field(primary_key=True)
     password_hash: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
-    preferences: dict = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="{}"))
+    preferences: dict = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default=text("'{}'::jsonb")))
 
 
 class UserRead(UserBase):
     id: str
     created_at: datetime
-    preferences: dict = {}
+    preferences: dict = Field(default_factory=dict)
 
 
 class UserCreate(BaseModel):
@@ -73,6 +73,11 @@ class UserLogin(BaseModel):
     password: str
 
 
+class UserUpdate(BaseModel):
+    name: Optional[str] = None
+    preferences: Optional[dict] = None
+
+
 class APIKey(SQLModel, table=True):
     __tablename__ = "api_keys"
     id: str = Field(primary_key=True)
@@ -80,7 +85,7 @@ class APIKey(SQLModel, table=True):
     name: str
     key_hash: str = Field(index=True)
     prefix: str
-    scopes: list = Field(default_factory=list, sa_column=Column(JSONB, nullable=False, server_default="[]"))
+    scopes: list = Field(default_factory=list, sa_column=Column(JSONB, nullable=False, server_default=text("'[]'::jsonb")))
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_used: Optional[datetime] = None
     expires_at: Optional[datetime] = None
@@ -280,15 +285,15 @@ async def get_profile(user: User = Depends(require_auth)):
 
 @app.put("/api/v1/user/me", tags=["Profile"])
 async def update_profile(
-    updates: dict,
+    updates: UserUpdate,
     user: User = Depends(require_auth),
     session: AsyncSession = Depends(get_session),
 ):
-    if "name" in updates:
-        user.name = updates["name"]
-    if "preferences" in updates:
+    if updates.name is not None:
+        user.name = updates.name
+    if updates.preferences is not None:
         merged = dict(user.preferences or {})
-        merged.update(updates["preferences"])
+        merged.update(updates.preferences)
         user.preferences = merged
     session.add(user)
     await session.commit()

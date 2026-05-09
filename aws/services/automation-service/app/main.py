@@ -19,7 +19,7 @@ from enum import Enum
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field as PydanticField
-from sqlalchemy import Column, desc
+from sqlalchemy import Column, desc, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import Field, SQLModel, select
@@ -63,8 +63,8 @@ class AutomationRule(SQLModel, table=True):
     description: Optional[str] = None
     template_id: Optional[str] = None
     trigger_type: str
-    trigger_config: dict = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="{}"))
-    actions: list = Field(default_factory=list, sa_column=Column(JSONB, nullable=False, server_default="[]"))
+    trigger_config: dict = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default=text("'{}'::jsonb")))
+    actions: list = Field(default_factory=list, sa_column=Column(JSONB, nullable=False, server_default=text("'[]'::jsonb")))
     enabled: bool = True
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_triggered: Optional[datetime] = None
@@ -85,8 +85,8 @@ class ExecutionLog(SQLModel, table=True):
     id: str = Field(primary_key=True)
     rule_id: str = Field(index=True)
     triggered_at: datetime = Field(default_factory=datetime.utcnow, index=True)
-    trigger_event: dict = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default="{}"))
-    actions_executed: list = Field(default_factory=list, sa_column=Column(JSONB, nullable=False, server_default="[]"))
+    trigger_event: dict = Field(default_factory=dict, sa_column=Column(JSONB, nullable=False, server_default=text("'{}'::jsonb")))
+    actions_executed: list = Field(default_factory=list, sa_column=Column(JSONB, nullable=False, server_default=text("'[]'::jsonb")))
     success: bool = True
     error: Optional[str] = None
 
