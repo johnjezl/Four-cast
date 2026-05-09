@@ -40,7 +40,7 @@ resource "aws_db_instance" "main" {
 
   engine            = "postgres"
   engine_version    = "15"
-  instance_class    = "db.t3.micro"  # Free tier eligible
+  instance_class    = "db.t3.micro" # Free tier eligible
   allocated_storage = 20
   storage_type      = "gp2"
 
@@ -55,8 +55,8 @@ resource "aws_db_instance" "main" {
   publicly_accessible = false
 
   backup_retention_period = 7
-  backup_window          = "03:00-04:00"
-  maintenance_window     = "Mon:04:00-Mon:05:00"
+  backup_window           = "03:00-04:00"
+  maintenance_window      = "Mon:04:00-Mon:05:00"
 
   tags = var.common_tags
 }

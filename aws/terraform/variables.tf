@@ -88,3 +88,9 @@ variable "enable_timestream" {
   type        = bool
   default     = false
 }
+
+variable "desired_count" {
+  description = "Number of task replicas per microservice (set 2+ to demo the load balancer)"
+  type        = number
+  default     = 2
+}

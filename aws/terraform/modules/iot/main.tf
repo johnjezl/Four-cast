@@ -75,9 +75,9 @@ resource "aws_iot_policy" "device_policy" {
 
 resource "aws_sqs_queue" "device_events" {
   name                       = "${var.name_prefix}-device-events"
-  message_retention_seconds  = 86400  # 1 day
+  message_retention_seconds  = 86400 # 1 day
   visibility_timeout_seconds = 30
-  receive_wait_time_seconds  = 10     # Long polling
+  receive_wait_time_seconds  = 10 # Long polling
 
   tags = merge(var.common_tags, {
     Name = "${var.name_prefix}-device-events"
@@ -86,7 +86,7 @@ resource "aws_sqs_queue" "device_events" {
 
 resource "aws_sqs_queue" "device_events_dlq" {
   name = "${var.name_prefix}-device-events-dlq"
-  
+
   tags = var.common_tags
 }
 
@@ -175,9 +175,9 @@ resource "aws_lambda_function" "tuya_poller" {
 
   environment {
     variables = {
-      TUYA_DEVICE_IDS   = var.tuya_device_ids
-      SECRET_NAME       = aws_secretsmanager_secret.tuya_credentials.name
-      IOT_ENDPOINT      = data.aws_iot_endpoint.current.endpoint_address
+      TUYA_DEVICE_IDS = var.tuya_device_ids
+      SECRET_NAME     = aws_secretsmanager_secret.tuya_credentials.name
+      IOT_ENDPOINT    = data.aws_iot_endpoint.current.endpoint_address
     }
   }
 
@@ -260,8 +260,8 @@ resource "aws_timestreamwrite_table" "device_telemetry" {
   table_name    = "device_telemetry"
 
   retention_properties {
-    memory_store_retention_period_in_hours  = 24      # Hot storage: 24 hours
-    magnetic_store_retention_period_in_days = 7       # Cold storage: 7 days
+    memory_store_retention_period_in_hours  = 24 # Hot storage: 24 hours
+    magnetic_store_retention_period_in_days = 7  # Cold storage: 7 days
   }
 
   tags = var.common_tags
@@ -319,8 +319,8 @@ resource "aws_iam_role" "lambda_role" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
       Principal = { Service = "lambda.amazonaws.com" }
     }]
   })
@@ -369,8 +369,8 @@ resource "aws_iam_role" "iot_sqs_role" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
       Principal = { Service = "iot.amazonaws.com" }
     }]
   })
@@ -401,8 +401,8 @@ resource "aws_iam_role" "iot_timestream_role" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
       Principal = { Service = "iot.amazonaws.com" }
     }]
   })

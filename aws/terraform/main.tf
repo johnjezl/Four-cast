@@ -26,6 +26,10 @@ terraform {
       source  = "hashicorp/archive"
       version = "~> 2.0"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
+    }
   }
 }
 
@@ -47,7 +51,7 @@ provider "aws" {
 # =============================================================================
 locals {
   name_prefix = "smarthome-${var.environment}"
-  
+
   common_tags = {
     Project     = "SmartHomePlatform"
     Environment = var.environment
@@ -115,6 +119,14 @@ module "database" {
 }
 
 # =============================================================================
+# JWT signing secret for user-service (shared across all instances)
+# =============================================================================
+resource "random_password" "jwt_secret" {
+  length  = 48
+  special = false
+}
+
+# =============================================================================
 # ECS Cluster Module (Fargate)
 # =============================================================================
 module "ecs" {
@@ -128,11 +140,15 @@ module "ecs" {
   services           = local.services
   db_endpoint        = module.database.db_endpoint
   db_name            = module.database.db_name
-  
+  db_username        = var.db_username
+  db_password        = var.db_password
+  jwt_secret         = random_password.jwt_secret.result
+  desired_count      = var.desired_count
+
   # IoT Core integration
-  iot_endpoint         = module.iot.iot_endpoint
-  device_events_queue  = module.iot.device_events_queue_url
-  
+  iot_endpoint        = module.iot.iot_endpoint
+  device_events_queue = module.iot.device_events_queue_url
+
   common_tags = local.common_tags
 }
 

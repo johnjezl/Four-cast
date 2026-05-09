@@ -180,7 +180,7 @@ resource "aws_ecs_task_definition" "services" {
       name      = each.key
       image     = "${aws_ecr_repository.services[each.key].repository_url}:latest"
       essential = true
-      
+
       portMappings = [
         {
           containerPort = each.value.port
@@ -188,16 +188,17 @@ resource "aws_ecs_task_definition" "services" {
           protocol      = "tcp"
         }
       ]
-      
+
       environment = [
         { name = "SERVICE_NAME", value = each.key },
         { name = "PORT", value = tostring(each.value.port) },
-        { name = "DATABASE_URL", value = "postgresql://${var.db_endpoint}/${var.db_name}" },
+        { name = "DATABASE_URL", value = "postgresql+asyncpg://${var.db_username}:${var.db_password}@${var.db_endpoint}/${var.db_name}" },
         { name = "IOT_ENDPOINT", value = var.iot_endpoint },
         { name = "DEVICE_EVENTS_QUEUE", value = var.device_events_queue },
-        { name = "ENVIRONMENT", value = var.environment }
+        { name = "ENVIRONMENT", value = var.environment },
+        { name = "JWT_SECRET", value = var.jwt_secret }
       ]
-      
+
       logConfiguration = {
         logDriver = "awslogs"
         options = {
@@ -221,7 +222,7 @@ resource "aws_ecs_service" "services" {
   name            = each.key
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.services[each.key].arn
-  desired_count   = 1
+  desired_count   = var.desired_count
   launch_type     = "FARGATE"
 
   network_configuration {
@@ -261,8 +262,8 @@ resource "aws_iam_role" "ecs_execution" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
       Principal = { Service = "ecs-tasks.amazonaws.com" }
     }]
   })
@@ -281,8 +282,8 @@ resource "aws_iam_role" "ecs_task" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
       Principal = { Service = "ecs-tasks.amazonaws.com" }
     }]
   })

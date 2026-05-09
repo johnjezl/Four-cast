@@ -39,6 +39,21 @@ variable "db_name" {
   default = "smarthome"
 }
 
+variable "db_username" {
+  type      = string
+  sensitive = true
+}
+
+variable "db_password" {
+  type      = string
+  sensitive = true
+}
+
+variable "jwt_secret" {
+  type      = string
+  sensitive = true
+}
+
 variable "iot_endpoint" {
   type = string
 }
@@ -49,4 +64,10 @@ variable "device_events_queue" {
 
 variable "common_tags" {
   type = map(string)
+}
+
+variable "desired_count" {
+  description = "Number of task replicas per service (for load-balancer demo)"
+  type        = number
+  default     = 2
 }
