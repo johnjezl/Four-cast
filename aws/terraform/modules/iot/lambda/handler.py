@@ -16,6 +16,7 @@ import os
 import hmac
 import hashlib
 import time
+import uuid
 import logging
 from typing import Optional
 from urllib.request import Request, urlopen
@@ -53,26 +54,34 @@ class TuyaCloud:
         self.token: Optional[str] = None
         self.token_expiry: float = 0
     
-    def _sign(self, payload: str) -> str:
+    def _sign(self, str_to_sign: str) -> str:
         """Generate HMAC-SHA256 signature."""
         return hmac.new(
             self.client_secret.encode('utf-8'),
-            payload.encode('utf-8'),
+            str_to_sign.encode('utf-8'),
             hashlib.sha256
         ).hexdigest().upper()
-    
+
+    def _build_sign_str(self, method: str, path: str, t: str, nonce: str,
+                        access_token: str = '', body: bytes = b'') -> str:
+        """Build the string to sign per Tuya's post-2021 algorithm."""
+        body_hash = hashlib.sha256(body).hexdigest()
+        string_to_sign = method + '\n' + body_hash + '\n\n' + path
+        return self.client_id + access_token + t + nonce + string_to_sign
+
     def _get_token(self) -> str:
         """Get or refresh access token."""
         if self.token and time.time() < self.token_expiry:
             return self.token
-        
+
         t = str(int(time.time() * 1000))
-        sign_str = self.client_id + t
-        sign = self._sign(sign_str)
-        
+        nonce = str(uuid.uuid4())
+        sign = self._sign(self._build_sign_str('GET', '/v1.0/token?grant_type=1', t, nonce))
+
         headers = {
             'client_id': self.client_id,
             't': t,
+            'nonce': nonce,
             'sign': sign,
             'sign_method': 'HMAC-SHA256',
         }
@@ -99,14 +108,15 @@ class TuyaCloud:
         """Make authenticated API request."""
         token = self._get_token()
         t = str(int(time.time() * 1000))
-        
-        sign_str = self.client_id + token + t
-        sign = self._sign(sign_str)
-        
+        nonce = str(uuid.uuid4())
+        body_bytes = json.dumps(body).encode('utf-8') if body else b''
+        sign = self._sign(self._build_sign_str(method, path, t, nonce, token, body_bytes))
+
         headers = {
             'client_id': self.client_id,
             'access_token': token,
             't': t,
+            'nonce': nonce,
             'sign': sign,
             'sign_method': 'HMAC-SHA256',
         }
@@ -129,9 +139,9 @@ class TuyaCloud:
     
     def get_device_status(self, device_id: str) -> list:
         """Get current status of a device."""
-        result = self._request('GET', f'/v1.0/devices/{device_id}/status')
+        result = self._request('GET', f'/v2.0/cloud/thing/{device_id}/shadow/properties')
         if result.get('success'):
-            return result.get('result', [])
+            return result.get('result', {}).get('properties', [])
         else:
             logger.error(f"Failed to get device status: {result}")
             return []
@@ -145,10 +155,9 @@ class TuyaCloud:
     
     def send_commands(self, device_id: str, commands: list) -> dict:
         """Send commands to a device."""
-        result = self._request('POST', f'/v1.0/devices/{device_id}/commands', {
+        return self._request('POST', f'/v1.0/iot-03/devices/{device_id}/commands', {
             'commands': commands
         })
-        return result
 
 
 # =============================================================================

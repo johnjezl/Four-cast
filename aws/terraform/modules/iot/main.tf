@@ -347,9 +347,9 @@ resource "aws_iam_role_policy" "lambda_policy" {
       {
         Effect = "Allow"
         Action = [
-          "iot-data:UpdateThingShadow",
-          "iot-data:GetThingShadow",
-          "iot-data:Publish"
+          "iotdata:UpdateThingShadow",
+          "iotdata:GetThingShadow",
+          "iotdata:Publish"
         ]
         Resource = ["*"]
       },

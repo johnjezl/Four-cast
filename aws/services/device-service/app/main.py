@@ -96,8 +96,9 @@ class DeviceStateUpdate(BaseModel):
 
 
 class CommandRequest(BaseModel):
-    command: str
-    value: Any
+    """Request body for sending commands."""
+    command: str  # e.g., "switch_led", "set_brightness"
+    value: Any    # e.g., True, 500, {"h": 120, "s": 255, "v": 255}
 
 
 # =============================================================================

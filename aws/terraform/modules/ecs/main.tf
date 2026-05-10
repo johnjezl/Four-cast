@@ -312,9 +312,10 @@ resource "aws_iam_role_policy" "ecs_task" {
       {
         Effect = "Allow"
         Action = [
-          "iot-data:Publish",
-          "iot-data:GetThingShadow",
-          "iot-data:UpdateThingShadow"
+          "iot:Publish",
+          "iot:GetThingShadow",
+          "iot:UpdateThingShadow",
+          "iot:DeleteThingShadow"
         ]
         Resource = ["*"]
       },
