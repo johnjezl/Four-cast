@@ -1,7 +1,9 @@
 #!/bin/bash
 set -e
 
-REGION="us-west-2"
+REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region)}}"
+: "${REGION:?REGION is not set; configure AWS CLI or export AWS_REGION}"
+
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 REGISTRY="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
 SERVICES=("device-service" "automation-service" "user-service" "analytics-service")
