@@ -178,6 +178,7 @@ module "iot" {
   tuya_client_secret = var.tuya_client_secret
   tuya_region        = var.tuya_region
   enable_timestream  = var.enable_timestream
+  alb_dns_name       = module.ecs.alb_dns_name
   common_tags        = local.common_tags
 }
 

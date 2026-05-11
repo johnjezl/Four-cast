@@ -286,6 +286,19 @@ async def create_device(
     if device_create.device_type_id not in device_types_db:
         raise HTTPException(status_code=400, detail="Invalid device type")
 
+    if device_create.tuya_device_id:
+        existing = (await session.execute(
+            select(Device).where(Device.tuya_device_id == device_create.tuya_device_id)
+        )).scalar_one_or_none()
+        if existing:
+            existing.name = device_create.name
+            if device_create.room is not None:
+                existing.room = device_create.room
+            session.add(existing)
+            await session.commit()
+            await session.refresh(existing)
+            return existing
+
     device_type = device_types_db[device_create.device_type_id]
     device_id = f"device-{uuid.uuid4().hex[:8]}"
 

@@ -48,3 +48,8 @@ variable "enable_timestream" {
   type        = bool
   default     = false
 }
+
+variable "alb_dns_name" {
+  description = "DNS name of the ALB so Lambdas can register discovered devices with device-service"
+  type        = string
+}

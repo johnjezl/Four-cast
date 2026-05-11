@@ -178,6 +178,7 @@ resource "aws_lambda_function" "tuya_poller" {
       TUYA_DEVICE_IDS = var.tuya_device_ids
       SECRET_NAME     = aws_secretsmanager_secret.tuya_credentials.name
       IOT_ENDPOINT    = data.aws_iot_endpoint.current.endpoint_address
+      ALB_URL         = "http://${var.alb_dns_name}"
     }
   }
 
