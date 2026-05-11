@@ -168,16 +168,26 @@ def require_auth(user: Optional[User] = Depends(get_current_user)) -> User:
 
 
 async def seed_demo_user() -> None:
-    """Ensure the demo user exists. Idempotent under concurrent startup."""
+    """Ensure the demo user exists with current values. Upserts so a stale
+    email from an earlier seed gets fixed on next startup."""
     async with async_session() as session:
+        demo_email = "john.doe@example.com"
         stmt = pg_insert(User).values(
             id="user-0001",
-            email="demo@smarthome.local",
+            email=demo_email,
             name="Demo User",
             role="developer",
             password_hash=hash_password("demo123"),
             preferences={},
-        ).on_conflict_do_nothing(index_elements=["email"])
+        ).on_conflict_do_update(
+            index_elements=["id"],
+            set_={
+                "email": demo_email,
+                "name": "Demo User",
+                "role": "developer",
+                "password_hash": hash_password("demo123"),
+            },
+        )
         await session.execute(stmt)
         await session.commit()
 

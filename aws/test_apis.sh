@@ -349,7 +349,7 @@ EXAMPLES
   test_apis.sh info --service device
   test_apis.sh device-create --name "Living Room Bulb" --room living
   test_apis.sh device-on --id device-7a3f2c1e
-  test_apis.sh login --email demo@smarthome.local --password demo123
+  test_apis.sh login --email john.doe@example.com --password demo123
   test_apis.sh me
   test_apis.sh raw GET /api/v1/automation/templates/sunset-lights
 
@@ -410,7 +410,7 @@ run_all() {
 
   section "user-service"
   TOKEN=""
-  call POST /api/v1/user/login 200 '{"email":"demo@smarthome.local","password":"demo123"}'
+  call POST /api/v1/user/login 200 '{"email":"john.doe@example.com","password":"demo123"}'
   TOKEN=$(jq -r '.token // empty' < "$RESP")
   if [ -n "$TOKEN" ]; then
     call GET /api/v1/user/me
