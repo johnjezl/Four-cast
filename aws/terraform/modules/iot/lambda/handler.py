@@ -159,23 +159,71 @@ class TuyaCloud:
             'commands': commands
         })
 
-    def list_devices(self, page_size: int = 100) -> list:
-        """List all devices in the cloud project, paginated."""
-        devices = []
-        last_id = ''
+    def list_spaces(self, page_size: int = 50) -> list:
+        """List space IDs accessible to the cloud project. Paginated.
+        Query params are sorted alphabetically — v2.0 endpoints reject
+        out-of-order params with code 1004 "sign invalid".
+        Returns a list of space ID strings."""
+        space_ids = []
+        page_no = 1
         while True:
-            path = f'/v1.3/iot-03/devices?page_size={page_size}'
-            if last_id:
-                path += f'&last_row_key={last_id}'
+            path = f'/v2.0/cloud/space/child?page_no={page_no}&page_size={page_size}'
             result = self._request('GET', path)
             if not result.get('success'):
-                logger.error(f"Failed to list devices: {result}")
+                logger.error(f"Failed to list spaces: {result}")
                 break
-            page = result.get('result', {}).get('list', [])
-            devices.extend(page)
-            if not result.get('result', {}).get('has_more') or not page:
+            result_dict = result.get('result') or {}
+            # Tuya returns the IDs under `data` for this endpoint; tolerate the
+            # other shapes too in case the response format varies.
+            page = (result_dict.get('data')
+                    or result_dict.get('list')
+                    or result_dict.get('data_list')
+                    or [])
+            if not page:
                 break
-            last_id = page[-1].get('id', '')
+            for item in page:
+                if isinstance(item, (int, str)):
+                    space_ids.append(str(item))
+                elif isinstance(item, dict):
+                    sid = item.get('space_id') or item.get('id')
+                    if sid:
+                        space_ids.append(str(sid))
+            if len(page) < page_size:
+                break
+            page_no += 1
+        return space_ids
+
+    def list_devices(self, space_ids: list = None, page_size: int = 10) -> list:
+        """List devices across Tuya spaces. If no space_ids are given, all
+        spaces accessible to the project are discovered first.
+
+        page_size is capped at 10 by Tuya — larger values return code
+        40000904 'param size too much'."""
+        if not space_ids:
+            space_ids = self.list_spaces()
+            logger.info(f"Discovered {len(space_ids)} Tuya space(s) to poll")
+        if not space_ids:
+            return []
+        devices = []
+        for space_id in space_ids:
+            page_no = 1
+            while True:
+                # Query params alphabetical: page_no, page_size, space_ids.
+                path = (f'/v2.0/cloud/thing/space/device'
+                        f'?page_no={page_no}&page_size={page_size}&space_ids={space_id}')
+                result = self._request('GET', path)
+                if not result.get('success'):
+                    logger.error(f"Failed to list devices in space {space_id}: {result}")
+                    break
+                page = result.get('result', [])
+                if isinstance(page, dict):
+                    page = page.get('list', []) or page.get('data_list', [])
+                if not page:
+                    break
+                devices.extend(page)
+                if len(page) < page_size:
+                    break
+                page_no += 1
         return devices
 
 
@@ -293,7 +341,7 @@ def poll_tuya_devices(event, context):
         region=creds.get('region', 'us'),
     )
 
-    # Discover devices from Tuya
+    # Discover devices across all spaces visible to the cloud project
     try:
         discovered = tuya.list_devices()
     except Exception as e:
@@ -306,18 +354,20 @@ def poll_tuya_devices(event, context):
     allowlist_str = os.environ.get('TUYA_DEVICE_IDS', '').strip()
     if allowlist_str:
         allowlist = {d.strip() for d in allowlist_str.split(',') if d.strip()}
-        discovered = [d for d in discovered if d.get('id') in allowlist]
+        discovered = [d for d in discovered if (d.get('id') or d.get('device_id')) in allowlist]
         logger.info(f"Filtered to {len(discovered)} device(s) via TUYA_DEVICE_IDS allowlist")
 
     results = []
     for device in discovered:
-        device_id = device.get('id')
+        # v2.0 may return either `id` or `device_id`; tolerate both.
+        device_id = device.get('id') or device.get('device_id')
         if not device_id:
             continue
 
         device_type_id = infer_device_type(device.get('category'))
+        device_name = device.get('name') or device.get('customName') or device.get('product_name', '')
         register_with_device_service(
-            name=device.get('name', ''),
+            name=device_name,
             tuya_device_id=device_id,
             device_type_id=device_type_id,
         )
@@ -348,22 +398,20 @@ def send_command_to_tuya(event, context):
     
     Triggered by IoT Core Rule when shadow update contains desired state.
     
-    Event Format (from IoT Rule):
+    Event Format (from IoT Rule, projected from $aws/things/+/shadow/update/delta):
         {
             "thingName": "tuya-<device_id>",
-            "state": {
-                "desired": {
-                    "switch_led": true,
-                    "bright_value_v2": 500
-                }
+            "desired": {
+                "switch_led": true,
+                "bright_value_v2": 500
             }
         }
     """
     logger.info(f"Received command event: {json.dumps(event)}")
-    
+
     # Parse event
     thing_name = event.get('thingName', '')
-    desired = event.get('state', {}).get('desired', {})
+    desired = event.get('desired', {})
     
     if not thing_name or not desired:
         logger.warning("Missing thingName or desired state")
@@ -413,19 +461,18 @@ def send_command_to_tuya(event, context):
         # Send commands to Tuya
         result = tuya.send_commands(device_id, commands)
         logger.info(f"Sent commands to {device_id}: {commands} -> {result}")
-        
+
         if result.get('success'):
-            # Clear desired state by updating shadow
-            # (In production, you might want to verify the command succeeded first)
-            iot_client.update_thing_shadow(
-                thingName=thing_name,
-                payload=json.dumps({
-                    'state': {
-                        'desired': None  # Clear desired state
-                    }
-                }).encode('utf-8')
-            )
-            
+            # Mirror the accepted command into `reported` so the delta clears
+            # immediately. Use the Tuya-coded keys (not the user-facing aliases)
+            # so the next poller tick overwrites cleanly without leaving stale
+            # duplicate-vocabulary keys in the shadow document.
+            reported = {cmd['code']: cmd['value'] for cmd in commands}
+            try:
+                update_iot_shadow(thing_name, reported)
+            except Exception as shadow_err:
+                logger.warning(f"Tuya accepted command but shadow update failed: {shadow_err}")
+
             return {
                 'statusCode': 200,
                 'body': json.dumps({

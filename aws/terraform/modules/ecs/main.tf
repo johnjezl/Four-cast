@@ -238,7 +238,8 @@ resource "aws_ecs_task_definition" "services" {
         { name = "IOT_ENDPOINT", value = var.iot_endpoint },
         { name = "DEVICE_EVENTS_QUEUE", value = var.device_events_queue },
         { name = "ENVIRONMENT", value = var.environment },
-        { name = "JWT_SECRET", value = var.jwt_secret }
+        { name = "JWT_SECRET", value = var.jwt_secret },
+        { name = "LOG_LEVEL", value = var.log_level }
       ]
 
       logConfiguration = {

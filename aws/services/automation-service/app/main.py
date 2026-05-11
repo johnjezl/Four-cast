@@ -26,7 +26,7 @@ from sqlmodel import Field, SQLModel, select
 
 from .db import async_session, engine, get_session, init_db
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger(__name__)
 
 DEVICE_EVENTS_QUEUE = os.getenv("DEVICE_EVENTS_QUEUE", "")

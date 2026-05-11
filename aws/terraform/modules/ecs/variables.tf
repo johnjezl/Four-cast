@@ -71,3 +71,9 @@ variable "desired_count" {
   type        = number
   default     = 2
 }
+
+variable "log_level" {
+  description = "Python logging level for service containers"
+  type        = string
+  default     = "INFO"
+}

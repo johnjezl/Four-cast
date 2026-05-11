@@ -7,3 +7,5 @@
 **/terraform.tfstate
 **/terraform.tfstate.*
 **/lambda.zip
+**/terraform.tfvars
+**/*.auto.tfvars

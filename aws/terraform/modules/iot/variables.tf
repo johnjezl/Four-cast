@@ -13,7 +13,7 @@ variable "environment" {
 }
 
 variable "tuya_device_ids" {
-  description = "Comma-separated list of Tuya device IDs"
+  description = "Optional comma-separated allowlist of Tuya device IDs"
   type        = string
   default     = ""
 }

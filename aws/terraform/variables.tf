@@ -48,8 +48,9 @@ variable "db_password" {
 # =============================================================================
 
 variable "tuya_device_ids" {
-  description = "Comma-separated list of Tuya device IDs to sync (leave blank if not using Tuya)"
+  description = "Optional comma-separated allowlist of Tuya device IDs to sync. If blank, all devices discovered across the project's spaces are polled."
   type        = string
+  default     = ""
 }
 
 variable "tuya_client_id" {
@@ -90,4 +91,14 @@ variable "desired_count" {
   description = "Number of task replicas per microservice (set 2+ to demo the load balancer)"
   type        = number
   default     = 2
+}
+
+variable "log_level" {
+  description = "Python logging level for the microservices (DEBUG, INFO, WARNING, ERROR). DEBUG also enables SQLAlchemy query echo."
+  type        = string
+  default     = "INFO"
+  validation {
+    condition     = contains(["DEBUG", "INFO", "WARNING", "ERROR"], upper(var.log_level))
+    error_message = "log_level must be one of DEBUG, INFO, WARNING, ERROR."
+  }
 }

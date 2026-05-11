@@ -13,7 +13,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 engine = create_async_engine(
     DATABASE_URL,
-    echo=False,
+    echo=os.getenv("LOG_LEVEL", "INFO").upper() == "DEBUG",
     pool_pre_ping=True,
     pool_size=2,
     max_overflow=3,

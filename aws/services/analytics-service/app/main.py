@@ -26,7 +26,7 @@ from botocore.exceptions import ClientError
 
 from .db import engine, get_session, init_db
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger(__name__)
 
 TIMESTREAM_DATABASE = os.getenv("TIMESTREAM_DATABASE", "")

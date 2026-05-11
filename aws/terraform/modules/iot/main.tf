@@ -128,7 +128,7 @@ resource "aws_iot_topic_rule" "command_to_tuya" {
   name        = "${replace(var.name_prefix, "-", "_")}_commands"
   description = "Forward commands to Lambda for Tuya delivery"
   enabled     = true
-  sql         = "SELECT *, topic(3) as thingName FROM '$aws/things/+/shadow/update' WHERE isUndefined(state.desired) = false"
+  sql         = "SELECT topic(3) as thingName, state as desired FROM '$aws/things/+/shadow/update/delta'"
   sql_version = "2016-03-23"
 
   lambda {
@@ -348,11 +348,12 @@ resource "aws_iam_role_policy" "lambda_policy" {
       {
         Effect = "Allow"
         Action = [
-          "iotdata:UpdateThingShadow",
-          "iotdata:GetThingShadow",
-          "iotdata:Publish"
+          "iot:UpdateThingShadow",
+          "iot:GetThingShadow"
         ]
-        Resource = ["*"]
+        Resource = [
+          "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:thing/tuya-*"
+        ]
       },
       {
         Effect   = "Allow"

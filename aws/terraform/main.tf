@@ -144,6 +144,7 @@ module "ecs" {
   db_password        = var.db_password
   jwt_secret         = random_password.jwt_secret.result
   desired_count      = var.desired_count
+  log_level          = var.log_level
 
   # IoT Core integration
   iot_endpoint        = module.iot.iot_endpoint
