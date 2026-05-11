@@ -48,23 +48,20 @@ variable "db_password" {
 # =============================================================================
 
 variable "tuya_device_ids" {
-  description = "Comma-separated list of Tuya device IDs to sync"
+  description = "Comma-separated list of Tuya device IDs to sync (leave blank if not using Tuya)"
   type        = string
-  default     = ""
 }
 
 variable "tuya_client_id" {
-  description = "Tuya Cloud API client ID"
+  description = "Tuya Cloud API client ID (leave blank if not using Tuya)"
   type        = string
   sensitive   = true
-  default     = ""
 }
 
 variable "tuya_client_secret" {
-  description = "Tuya Cloud API client secret"
+  description = "Tuya Cloud API client secret (leave blank if not using Tuya)"
   type        = string
   sensitive   = true
-  default     = ""
 }
 
 variable "tuya_region" {
