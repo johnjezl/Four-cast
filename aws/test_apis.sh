@@ -202,7 +202,15 @@ op_register() {
   call POST /api/v1/user/register 201 "$body"
 }
 op_login() {
-  need EMAIL; need PASSWORD
+  if [ -z "${EMAIL:-}" ]; then
+    read -r -p "Email: " EMAIL
+  fi
+  if [ -z "${PASSWORD:-}" ]; then
+    read -r -s -p "Password: " PASSWORD
+    echo   # newline after the silent prompt
+  fi
+  [ -n "$EMAIL" ]    || { echo "ERROR: email is required" >&2; exit 2; }
+  [ -n "$PASSWORD" ] || { echo "ERROR: password is required" >&2; exit 2; }
   local body
   body=$(jq -nc --arg e "$EMAIL" --arg p "$PASSWORD" '{email:$e, password:$p}')
   TOKEN=""   # don't send a stale token to /login
@@ -311,7 +319,7 @@ AUTOMATION-SERVICE
 
 USER-SERVICE
   register                      --email E --name N --password P
-  login                         --email E --password P     # JWT saved to /tmp
+  login                         [--email E] [--password P]  # prompts if omitted; JWT saved to /tmp
   me
   me-update                     [--name N] [--prefs '{"theme":"dark"}']
   prefs-get
