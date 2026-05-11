@@ -37,6 +37,45 @@ resource "aws_ecr_repository" "services" {
 }
 
 # -----------------------------------------------------------------------------
+# Build and push container images on apply
+# -----------------------------------------------------------------------------
+# Rebuilds only when the relevant service source files actually change.
+# Requires `docker` and `aws` CLI to be available on the machine running
+# `terraform apply`, and the current user to be in the `docker` group.
+resource "null_resource" "build_and_push" {
+  for_each = var.services
+
+  triggers = {
+    repo_url = aws_ecr_repository.services[each.key].repository_url
+    src_hash = sha256(join("|", concat(
+      [for f in fileset("${path.root}/../services/${each.key}", "app/**/*.py") :
+      "${f}=${filesha256("${path.root}/../services/${each.key}/${f}")}"],
+      [for f in fileset("${path.root}/../services/${each.key}", "Dockerfile") :
+      "${f}=${filesha256("${path.root}/../services/${each.key}/${f}")}"],
+      [for f in fileset("${path.root}/../services/${each.key}", "requirements.txt") :
+      "${f}=${filesha256("${path.root}/../services/${each.key}/${f}")}"],
+    )))
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      REPO_URL="${aws_ecr_repository.services[each.key].repository_url}"
+      REGISTRY="$${REPO_URL%%/*}"
+      SERVICE_DIR="${path.root}/../services/${each.key}"
+      REGION="${data.aws_region.current.name}"
+
+      echo ">>> Building and pushing $${REPO_URL}:latest"
+      aws ecr get-login-password --region "$REGION" | \
+        docker login --username AWS --password-stdin "$REGISTRY" >/dev/null
+      docker build -t "$${REPO_URL}:latest" "$SERVICE_DIR"
+      docker push "$${REPO_URL}:latest"
+    EOT
+  }
+}
+
+# -----------------------------------------------------------------------------
 # Application Load Balancer
 # -----------------------------------------------------------------------------
 resource "aws_lb" "main" {
@@ -175,6 +214,8 @@ resource "aws_ecs_task_definition" "services" {
   memory                   = each.value.memory
   execution_role_arn       = aws_iam_role.ecs_execution.arn
   task_role_arn            = aws_iam_role.ecs_task.arn
+
+  depends_on = [null_resource.build_and_push]
 
   container_definitions = jsonencode([
     {
