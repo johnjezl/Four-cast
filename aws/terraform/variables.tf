@@ -48,23 +48,20 @@ variable "db_password" {
 # =============================================================================
 
 variable "tuya_device_ids" {
-  description = "Comma-separated list of Tuya device IDs to sync"
+  description = "Comma-separated list of Tuya device IDs to sync (leave blank if not using Tuya)"
   type        = string
-  default     = ""
 }
 
 variable "tuya_client_id" {
-  description = "Tuya Cloud API client ID"
+  description = "Tuya Cloud API client ID (leave blank if not using Tuya)"
   type        = string
   sensitive   = true
-  default     = ""
 }
 
 variable "tuya_client_secret" {
-  description = "Tuya Cloud API client secret"
+  description = "Tuya Cloud API client secret (leave blank if not using Tuya)"
   type        = string
   sensitive   = true
-  default     = ""
 }
 
 variable "tuya_region" {
@@ -87,4 +84,10 @@ variable "enable_timestream" {
   description = "Enable Timestream for metrics (closed to new AWS customers since 2025)"
   type        = bool
   default     = false
+}
+
+variable "desired_count" {
+  description = "Number of task replicas per microservice (set 2+ to demo the load balancer)"
+  type        = number
+  default     = 2
 }

@@ -16,6 +16,7 @@ import os
 import hmac
 import hashlib
 import time
+import uuid
 import logging
 from typing import Optional
 from urllib.request import Request, urlopen
@@ -53,26 +54,34 @@ class TuyaCloud:
         self.token: Optional[str] = None
         self.token_expiry: float = 0
     
-    def _sign(self, payload: str) -> str:
+    def _sign(self, str_to_sign: str) -> str:
         """Generate HMAC-SHA256 signature."""
         return hmac.new(
             self.client_secret.encode('utf-8'),
-            payload.encode('utf-8'),
+            str_to_sign.encode('utf-8'),
             hashlib.sha256
         ).hexdigest().upper()
-    
+
+    def _build_sign_str(self, method: str, path: str, t: str, nonce: str,
+                        access_token: str = '', body: bytes = b'') -> str:
+        """Build the string to sign per Tuya's post-2021 algorithm."""
+        body_hash = hashlib.sha256(body).hexdigest()
+        string_to_sign = method + '\n' + body_hash + '\n\n' + path
+        return self.client_id + access_token + t + nonce + string_to_sign
+
     def _get_token(self) -> str:
         """Get or refresh access token."""
         if self.token and time.time() < self.token_expiry:
             return self.token
-        
+
         t = str(int(time.time() * 1000))
-        sign_str = self.client_id + t
-        sign = self._sign(sign_str)
-        
+        nonce = str(uuid.uuid4())
+        sign = self._sign(self._build_sign_str('GET', '/v1.0/token?grant_type=1', t, nonce))
+
         headers = {
             'client_id': self.client_id,
             't': t,
+            'nonce': nonce,
             'sign': sign,
             'sign_method': 'HMAC-SHA256',
         }
@@ -99,14 +108,15 @@ class TuyaCloud:
         """Make authenticated API request."""
         token = self._get_token()
         t = str(int(time.time() * 1000))
-        
-        sign_str = self.client_id + token + t
-        sign = self._sign(sign_str)
-        
+        nonce = str(uuid.uuid4())
+        body_bytes = json.dumps(body).encode('utf-8') if body else b''
+        sign = self._sign(self._build_sign_str(method, path, t, nonce, token, body_bytes))
+
         headers = {
             'client_id': self.client_id,
             'access_token': token,
             't': t,
+            'nonce': nonce,
             'sign': sign,
             'sign_method': 'HMAC-SHA256',
         }
@@ -129,9 +139,9 @@ class TuyaCloud:
     
     def get_device_status(self, device_id: str) -> list:
         """Get current status of a device."""
-        result = self._request('GET', f'/v1.0/devices/{device_id}/status')
+        result = self._request('GET', f'/v2.0/cloud/thing/{device_id}/shadow/properties')
         if result.get('success'):
-            return result.get('result', [])
+            return result.get('result', {}).get('properties', [])
         else:
             logger.error(f"Failed to get device status: {result}")
             return []
@@ -145,10 +155,28 @@ class TuyaCloud:
     
     def send_commands(self, device_id: str, commands: list) -> dict:
         """Send commands to a device."""
-        result = self._request('POST', f'/v1.0/devices/{device_id}/commands', {
+        return self._request('POST', f'/v1.0/iot-03/devices/{device_id}/commands', {
             'commands': commands
         })
-        return result
+
+    def list_devices(self, page_size: int = 100) -> list:
+        """List all devices in the cloud project, paginated."""
+        devices = []
+        last_id = ''
+        while True:
+            path = f'/v1.3/iot-03/devices?page_size={page_size}'
+            if last_id:
+                path += f'&last_row_key={last_id}'
+            result = self._request('GET', path)
+            if not result.get('success'):
+                logger.error(f"Failed to list devices: {result}")
+                break
+            page = result.get('result', {}).get('list', [])
+            devices.extend(page)
+            if not result.get('result', {}).get('has_more') or not page:
+                break
+            last_id = page[-1].get('id', '')
+        return devices
 
 
 # =============================================================================
@@ -187,9 +215,55 @@ def tuya_status_to_shadow(status: list) -> dict:
         code = item.get('code')
         value = item.get('value')
         shadow[code] = value
-    
+
     shadow['last_sync'] = int(time.time())
     return shadow
+
+
+# Map Tuya device categories to our seeded device_type_ids.
+# Tuya category reference: dj=light, kg=switch, cz=socket/plug.
+_CATEGORY_TO_TYPE = {
+    'dj': 'tuya-smart-bulb',
+    'dd': 'tuya-smart-bulb',
+    'xdd': 'tuya-smart-bulb',
+    'kg': 'tuya-smart-plug',
+    'cz': 'tuya-smart-plug',
+    'pc': 'tuya-smart-plug',
+}
+
+
+def infer_device_type(tuya_category: str) -> str:
+    return _CATEGORY_TO_TYPE.get((tuya_category or '').lower(), 'tuya-smart-bulb')
+
+
+def register_with_device_service(name: str, tuya_device_id: str, device_type_id: str) -> bool:
+    """POST to device-service. Idempotent — device-service upserts on tuya_device_id."""
+    alb_url = os.environ.get('ALB_URL', '').rstrip('/')
+    if not alb_url:
+        logger.warning("ALB_URL not set; skipping device-service registration")
+        return False
+
+    payload = json.dumps({
+        'name': name or f'Tuya {tuya_device_id[:8]}',
+        'device_type_id': device_type_id,
+        'tuya_device_id': tuya_device_id,
+    }).encode('utf-8')
+
+    request = Request(
+        f'{alb_url}/api/v1/device/devices',
+        data=payload,
+        headers={'Content-Type': 'application/json'},
+        method='POST',
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            return response.status in (200, 201)
+    except HTTPError as e:
+        logger.warning(f"device-service register failed for {tuya_device_id}: {e.code} {e.reason}")
+        return False
+    except Exception as e:
+        logger.warning(f"device-service register error for {tuya_device_id}: {e}")
+        return False
 
 
 # =============================================================================
@@ -198,74 +272,73 @@ def tuya_status_to_shadow(status: list) -> dict:
 
 def poll_tuya_devices(event, context):
     """
-    Poll Tuya Cloud for device states and update IoT Core shadows.
-    
-    Triggered by EventBridge on a schedule (every 1 minute).
-    
+    Discover devices from Tuya, register them with device-service, then sync
+    each device's current state into IoT Core shadows.
+
+    Triggered by EventBridge on a 1-minute schedule.
+
     Environment Variables:
-        TUYA_DEVICE_IDS: Comma-separated list of device IDs
-        SECRET_NAME: Secrets Manager secret with Tuya credentials
+        SECRET_NAME      Secrets Manager secret with Tuya credentials (required)
+        ALB_URL          Base URL of the device-service ALB (required for registration)
+        TUYA_DEVICE_IDS  Optional comma-separated allowlist; if set, only these
+                         IDs are polled. Useful for testing. When unset, all
+                         devices discovered from Tuya are polled.
     """
     logger.info("Starting Tuya device poll")
-    
-    # Get device IDs from environment
-    device_ids_str = os.environ.get('TUYA_DEVICE_IDS', '')
-    device_ids = [d.strip() for d in device_ids_str.split(',') if d.strip()]
-    
-    if not device_ids:
-        logger.warning("No device IDs configured")
-        return {'statusCode': 200, 'body': 'No devices to poll'}
-    
-    # Initialize Tuya client
+
     creds = get_tuya_credentials()
     tuya = TuyaCloud(
         client_id=creds['client_id'],
         client_secret=creds['client_secret'],
-        region=creds.get('region', 'us')
+        region=creds.get('region', 'us'),
     )
-    
+
+    # Discover devices from Tuya
+    try:
+        discovered = tuya.list_devices()
+    except Exception as e:
+        logger.error(f"Failed to list devices from Tuya: {e}")
+        return {'statusCode': 500, 'body': f'Tuya list_devices failed: {e}'}
+
+    logger.info(f"Discovered {len(discovered)} device(s) from Tuya")
+
+    # Optional allowlist for targeted testing
+    allowlist_str = os.environ.get('TUYA_DEVICE_IDS', '').strip()
+    if allowlist_str:
+        allowlist = {d.strip() for d in allowlist_str.split(',') if d.strip()}
+        discovered = [d for d in discovered if d.get('id') in allowlist]
+        logger.info(f"Filtered to {len(discovered)} device(s) via TUYA_DEVICE_IDS allowlist")
+
     results = []
-    
-    for device_id in device_ids:
+    for device in discovered:
+        device_id = device.get('id')
+        if not device_id:
+            continue
+
+        device_type_id = infer_device_type(device.get('category'))
+        register_with_device_service(
+            name=device.get('name', ''),
+            tuya_device_id=device_id,
+            device_type_id=device_type_id,
+        )
+
         try:
-            # Get device status from Tuya
             status = tuya.get_device_status(device_id)
-            
             if status:
-                # Convert to shadow format
                 shadow_state = tuya_status_to_shadow(status)
-                
-                # Update IoT Core shadow
-                thing_name = f"tuya-{device_id}"
-                update_iot_shadow(thing_name, shadow_state)
-                
-                results.append({
-                    'device_id': device_id,
-                    'status': 'success',
-                    'state': shadow_state
-                })
+                update_iot_shadow(f"tuya-{device_id}", shadow_state)
+                results.append({'device_id': device_id, 'status': 'success', 'state': shadow_state})
                 logger.info(f"Synced device {device_id}: {shadow_state}")
             else:
-                results.append({
-                    'device_id': device_id,
-                    'status': 'no_data'
-                })
+                results.append({'device_id': device_id, 'status': 'no_data'})
                 logger.warning(f"No status data for device {device_id}")
-                
         except Exception as e:
-            logger.error(f"Error polling device {device_id}: {str(e)}")
-            results.append({
-                'device_id': device_id,
-                'status': 'error',
-                'error': str(e)
-            })
-    
+            logger.error(f"Error polling device {device_id}: {e}")
+            results.append({'device_id': device_id, 'status': 'error', 'error': str(e)})
+
     return {
         'statusCode': 200,
-        'body': json.dumps({
-            'message': 'Poll complete',
-            'devices': results
-        })
+        'body': json.dumps({'message': 'Poll complete', 'devices': results}),
     }
 
 

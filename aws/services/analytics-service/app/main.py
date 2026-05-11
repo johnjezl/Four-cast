@@ -1,82 +1,73 @@
 """
 Analytics Service
 =================
-Provides metrics, SLOs, and developer experience analytics.
+Provides metrics, SLOs, and developer-experience analytics.
 
-Textbook Reference:
-- Ch. 6-7: Developer Experience Metrics
-- Ch. 7: Platform Maturity Model
-
-AWS Services Used:
-- Timestream: Time-series device metrics storage
-- CloudWatch: Platform operational metrics
+Storage: Postgres for tracked DevEx metrics. SLOs, current metrics,
+maturity dashboards, and other static/mock data remain in-memory.
 """
 
 import os
-import json
+import uuid
+import socket
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
 from contextlib import asynccontextmanager
-from collections import defaultdict
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+from sqlalchemy import desc
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import Field, SQLModel, select
 import boto3
 from botocore.exceptions import ClientError
+
+from .db import engine, get_session, init_db
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration
 TIMESTREAM_DATABASE = os.getenv("TIMESTREAM_DATABASE", "")
 TIMESTREAM_TABLE = os.getenv("TIMESTREAM_TABLE", "device_telemetry")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
 
 # =============================================================================
-# Data Models
+# Models
 # =============================================================================
 
 class SLODefinition(BaseModel):
-    """Service Level Objective definition."""
     id: str
     name: str
     description: str
     metric: str
     target: float
-    window: str = "30d"  # 30 days rolling window
-    operator: str = "gte"  # gte, lte, eq
+    window: str = "30d"
+    operator: str = "gte"
 
 
 class SLOStatus(BaseModel):
-    """Current SLO status."""
     slo_id: str
     name: str
     target: float
     current: float
-    status: str  # healthy, warning, breached
+    status: str
     error_budget_remaining: float
 
 
-class DevExMetric(BaseModel):
-    """Developer Experience metric."""
-    id: str
-    name: str
-    category: str  # onboarding, deployment, debugging
+class DevExMetric(SQLModel, table=True):
+    __tablename__ = "devex_metrics"
+    id: str = Field(primary_key=True)
+    name: str = Field(index=True)
+    category: str = Field(default="general", index=True)
     value: float
-    unit: str
-    measured_at: datetime = Field(default_factory=datetime.utcnow)
+    unit: str = "custom"
+    measured_at: datetime = Field(default_factory=datetime.utcnow, index=True)
 
 
 class PlatformMaturityAssessment(BaseModel):
-    """
-    Platform Maturity Model assessment.
-    
-    Textbook Reference: Ch. 7 - Platform Maturity Model
-    Levels: Provisional (1), Operational (2), Scalable (3), Optimizing (4)
-    """
     dimension: str
     level: int
     score: float
@@ -85,18 +76,17 @@ class PlatformMaturityAssessment(BaseModel):
 
 
 # =============================================================================
-# In-Memory Storage & Mock Data
+# Static / Mock Data
 # =============================================================================
 
-# SLO Definitions
 slos_db: dict[str, SLODefinition] = {
     "device-registration-latency": SLODefinition(
         id="device-registration-latency",
         name="Device Registration Latency",
         description="Time to register a new device should be under 2 seconds",
         metric="device.registration.latency_p95",
-        target=2000,  # milliseconds
-        operator="lte"
+        target=2000,
+        operator="lte",
     ),
     "api-availability": SLODefinition(
         id="api-availability",
@@ -104,7 +94,7 @@ slos_db: dict[str, SLODefinition] = {
         description="API should be available 99.5% of the time",
         metric="api.availability",
         target=99.5,
-        operator="gte"
+        operator="gte",
     ),
     "device-sync-success": SLODefinition(
         id="device-sync-success",
@@ -112,31 +102,24 @@ slos_db: dict[str, SLODefinition] = {
         description="Device state sync should succeed 99% of the time",
         metric="device.sync.success_rate",
         target=99.0,
-        operator="gte"
+        operator="gte",
     ),
     "time-to-first-device": SLODefinition(
         id="time-to-first-device",
         name="Time to First Device",
         description="New users should register their first device within 5 minutes",
         metric="devex.time_to_first_device",
-        target=300,  # seconds
-        operator="lte"
-    )
+        target=300,
+        operator="lte",
+    ),
 }
 
-# Simulated current metrics
 current_metrics = {
-    "device.registration.latency_p95": 850,  # ms
-    "api.availability": 99.8,  # %
-    "device.sync.success_rate": 99.5,  # %
-    "devex.time_to_first_device": 180,  # seconds
+    "device.registration.latency_p95": 850,
+    "api.availability": 99.8,
+    "device.sync.success_rate": 99.5,
+    "devex.time_to_first_device": 180,
 }
-
-# DevEx Metrics history
-devex_metrics: list[DevExMetric] = []
-
-# Platform usage stats
-usage_stats = defaultdict(int)
 
 
 # =============================================================================
@@ -150,15 +133,13 @@ def get_timestream_client():
 
 
 async def query_device_metrics(device_id: str, metric: str, hours: int = 24) -> list:
-    """Query device metrics from Timestream."""
     client = get_timestream_client()
     if not client:
-        # Return mock data
         return [
-            {"time": datetime.utcnow() - timedelta(hours=i), "value": 75 + (i % 10)}
+            {"time": (datetime.utcnow() - timedelta(hours=i)).isoformat(), "value": 75 + (i % 10)}
             for i in range(hours)
         ]
-    
+
     try:
         query = f"""
             SELECT time, measure_value::double as value
@@ -186,15 +167,17 @@ async def query_device_metrics(device_id: str, metric: str, hours: int = 24) -> 
 async def lifespan(app: FastAPI):
     logger.info("Analytics Service starting...")
     logger.info(f"Timestream DB: {TIMESTREAM_DATABASE or 'Not configured (using mock data)'}")
+    await init_db()
     yield
+    await engine.dispose()
     logger.info("Analytics Service shutting down...")
 
 
 app = FastAPI(
     title="Analytics Service",
     description="Metrics, SLOs, and Developer Experience Analytics",
-    version="1.0.0",
-    lifespan=lifespan
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -218,57 +201,46 @@ async def health():
 async def info():
     return {
         "service": "analytics-service",
+        "instance": socket.gethostname(),
         "timestream_configured": bool(TIMESTREAM_DATABASE),
         "slos_defined": len(slos_db),
-        "metrics_tracked": len(current_metrics)
+        "metrics_tracked": len(current_metrics),
     }
 
 
-# =============================================================================
-# SLO Endpoints
-# =============================================================================
-
+# SLOs
 @app.get("/api/v1/analytics/slos", tags=["SLOs"])
 async def list_slos():
-    """
-    List all defined SLOs.
-    
-    Textbook Reference: Ch. 6-7 - SLOs for platform health
-    """
     return {"slos": list(slos_db.values())}
 
 
 @app.get("/api/v1/analytics/slos/status", tags=["SLOs"])
 async def get_slo_status():
-    """Get current status of all SLOs."""
     statuses = []
-    
     for slo in slos_db.values():
         current = current_metrics.get(slo.metric, 0)
-        
         if slo.operator == "gte":
             met = current >= slo.target
             error_budget = max(0, current - slo.target) / slo.target * 100
         else:
             met = current <= slo.target
             error_budget = max(0, slo.target - current) / slo.target * 100
-        
+
         if met:
             status = "healthy"
         elif error_budget > 0.5:
             status = "warning"
         else:
             status = "breached"
-        
+
         statuses.append(SLOStatus(
             slo_id=slo.id,
             name=slo.name,
             target=slo.target,
             current=current,
             status=status,
-            error_budget_remaining=min(100, error_budget)
+            error_budget_remaining=min(100, error_budget),
         ))
-    
     return {"slo_status": statuses}
 
 
@@ -279,78 +251,56 @@ async def get_slo(slo_id: str):
     return slos_db[slo_id]
 
 
-# =============================================================================
-# Developer Experience Metrics
-# =============================================================================
-
+# DevEx
 @app.get("/api/v1/analytics/devex", tags=["DevEx"])
 async def get_devex_metrics():
-    """
-    Get Developer Experience metrics.
-    
-    Textbook Reference: Ch. 6-7 - DevEx metrics for platform success
-    """
     return {
         "metrics": {
-            "time_to_first_device": {
-                "value": 180,
-                "unit": "seconds",
-                "target": 300,
-                "status": "healthy"
-            },
-            "api_docs_satisfaction": {
-                "value": 4.2,
-                "unit": "rating",
-                "target": 4.0,
-                "status": "healthy"
-            },
-            "deployment_frequency": {
-                "value": 12,
-                "unit": "deploys/week",
-                "target": 10,
-                "status": "healthy"
-            },
-            "mean_time_to_recovery": {
-                "value": 15,
-                "unit": "minutes",
-                "target": 30,
-                "status": "healthy"
-            },
-            "golden_path_adoption": {
-                "value": 85,
-                "unit": "percent",
-                "target": 80,
-                "status": "healthy"
-            }
+            "time_to_first_device": {"value": 180, "unit": "seconds", "target": 300, "status": "healthy"},
+            "api_docs_satisfaction": {"value": 4.2, "unit": "rating", "target": 4.0, "status": "healthy"},
+            "deployment_frequency": {"value": 12, "unit": "deploys/week", "target": 10, "status": "healthy"},
+            "mean_time_to_recovery": {"value": 15, "unit": "minutes", "target": 30, "status": "healthy"},
+            "golden_path_adoption": {"value": 85, "unit": "percent", "target": 80, "status": "healthy"},
         }
     }
 
 
 @app.post("/api/v1/analytics/devex/track", tags=["DevEx"])
-async def track_devex_event(metric_name: str, value: float, category: str = "general"):
-    """Track a DevEx metric."""
+async def track_devex_event(
+    metric_name: str,
+    value: float,
+    category: str = "general",
+    session: AsyncSession = Depends(get_session),
+):
     metric = DevExMetric(
-        id=f"metric-{len(devex_metrics) + 1}",
+        id=f"metric-{uuid.uuid4().hex[:10]}",
         name=metric_name,
         category=category,
         value=value,
-        unit="custom"
+        unit="custom",
     )
-    devex_metrics.append(metric)
+    session.add(metric)
+    await session.commit()
+    await session.refresh(metric)
     return {"tracked": metric}
 
 
-# =============================================================================
-# Platform Maturity Assessment
-# =============================================================================
+@app.get("/api/v1/analytics/devex/recent", tags=["DevEx"])
+async def get_recent_devex_metrics(
+    limit: int = Query(50, ge=1, le=500),
+    category: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    stmt = select(DevExMetric).order_by(desc(DevExMetric.measured_at)).limit(limit)
+    if category:
+        stmt = stmt.where(DevExMetric.category == category)
+    metrics = (await session.execute(stmt)).scalars().all()
+    return {"metrics": metrics}
 
+
+# Maturity (static)
 @app.get("/api/v1/analytics/maturity", tags=["Maturity"])
 async def get_maturity_assessment():
-    """
-    Platform Maturity Model assessment.
-    
-    Textbook Reference: Ch. 7 - Platform Maturity Model
-    """
     return {
         "overall_level": 2,
         "overall_score": 2.4,
@@ -362,12 +312,9 @@ async def get_maturity_assessment():
                 evidence=[
                     "Infrastructure as Code (Terraform)",
                     "Automated deployments via CI/CD",
-                    "Container orchestration (ECS Fargate)"
+                    "Container orchestration (ECS Fargate)",
                 ],
-                recommendations=[
-                    "Add multi-region deployment",
-                    "Implement chaos engineering"
-                ]
+                recommendations=["Add multi-region deployment", "Implement chaos engineering"],
             ),
             PlatformMaturityAssessment(
                 dimension="Developer Experience",
@@ -376,13 +323,13 @@ async def get_maturity_assessment():
                 evidence=[
                     "Self-service API for device registration",
                     "API documentation available",
-                    "Golden Path templates for automations"
+                    "Golden Path templates for automations",
                 ],
                 recommendations=[
                     "Add interactive API explorer",
                     "Implement developer portal",
-                    "Add more Golden Path templates"
-                ]
+                    "Add more Golden Path templates",
+                ],
             ),
             PlatformMaturityAssessment(
                 dimension="Observability",
@@ -391,13 +338,13 @@ async def get_maturity_assessment():
                 evidence=[
                     "Centralized logging (CloudWatch)",
                     "Basic SLO tracking",
-                    "Time-series metrics (Timestream)"
+                    "Time-series metrics (Timestream)",
                 ],
                 recommendations=[
                     "Add distributed tracing",
                     "Implement SLO dashboards",
-                    "Add alerting automation"
-                ]
+                    "Add alerting automation",
+                ],
             ),
             PlatformMaturityAssessment(
                 dimension="Security",
@@ -406,58 +353,44 @@ async def get_maturity_assessment():
                 evidence=[
                     "API key authentication",
                     "Secrets management (Secrets Manager)",
-                    "Security scanning in CI/CD"
+                    "Security scanning in CI/CD",
                 ],
-                recommendations=[
-                    "Add OAuth2/OIDC support",
-                    "Implement RBAC",
-                    "Add audit logging"
-                ]
-            )
-        ]
+                recommendations=["Add OAuth2/OIDC support", "Implement RBAC", "Add audit logging"],
+            ),
+        ],
     }
 
 
-# =============================================================================
-# Device Analytics
-# =============================================================================
-
+# Device analytics (Timestream)
 @app.get("/api/v1/analytics/devices/{device_id}/metrics", tags=["Device Analytics"])
 async def get_device_metrics(
     device_id: str,
     metric: str = Query("brightness", description="Metric to query"),
-    hours: int = Query(24, ge=1, le=168)
+    hours: int = Query(24, ge=1, le=168),
 ):
-    """Get device metrics from Timestream."""
     data = await query_device_metrics(device_id, metric, hours)
     return {
         "device_id": device_id,
         "metric": metric,
         "period_hours": hours,
-        "data": data
+        "data": data,
     }
 
 
 @app.get("/api/v1/analytics/devices/summary", tags=["Device Analytics"])
 async def get_devices_summary():
-    """Get summary analytics for all devices."""
     return {
         "total_devices": 5,
         "online_devices": 4,
         "offline_devices": 1,
         "commands_today": 127,
         "automations_triggered": 23,
-        "avg_response_time_ms": 245
+        "avg_response_time_ms": 245,
     }
 
 
-# =============================================================================
-# Usage Statistics
-# =============================================================================
-
 @app.get("/api/v1/analytics/usage", tags=["Usage"])
 async def get_usage_stats():
-    """Get platform usage statistics."""
     return {
         "api_calls_24h": 1523,
         "unique_users_24h": 12,
@@ -466,8 +399,8 @@ async def get_usage_stats():
         "top_endpoints": [
             {"endpoint": "/api/v1/device/devices", "calls": 450},
             {"endpoint": "/api/v1/device/devices/{id}/state", "calls": 320},
-            {"endpoint": "/api/v1/automation/rules", "calls": 180}
-        ]
+            {"endpoint": "/api/v1/automation/rules", "calls": 180},
+        ],
     }
 
 

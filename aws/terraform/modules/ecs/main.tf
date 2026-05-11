@@ -37,6 +37,45 @@ resource "aws_ecr_repository" "services" {
 }
 
 # -----------------------------------------------------------------------------
+# Build and push container images on apply
+# -----------------------------------------------------------------------------
+# Rebuilds only when the relevant service source files actually change.
+# Requires `docker` and `aws` CLI to be available on the machine running
+# `terraform apply`, and the current user to be in the `docker` group.
+resource "null_resource" "build_and_push" {
+  for_each = var.services
+
+  triggers = {
+    repo_url = aws_ecr_repository.services[each.key].repository_url
+    src_hash = sha256(join("|", concat(
+      [for f in fileset("${path.root}/../services/${each.key}", "app/**/*.py") :
+      "${f}=${filesha256("${path.root}/../services/${each.key}/${f}")}"],
+      [for f in fileset("${path.root}/../services/${each.key}", "Dockerfile") :
+      "${f}=${filesha256("${path.root}/../services/${each.key}/${f}")}"],
+      [for f in fileset("${path.root}/../services/${each.key}", "requirements.txt") :
+      "${f}=${filesha256("${path.root}/../services/${each.key}/${f}")}"],
+    )))
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      REPO_URL="${aws_ecr_repository.services[each.key].repository_url}"
+      REGISTRY="$${REPO_URL%%/*}"
+      SERVICE_DIR="${path.root}/../services/${each.key}"
+      REGION="${data.aws_region.current.name}"
+
+      echo ">>> Building and pushing $${REPO_URL}:latest"
+      aws ecr get-login-password --region "$REGION" | \
+        docker login --username AWS --password-stdin "$REGISTRY" >/dev/null
+      docker build -t "$${REPO_URL}:latest" "$SERVICE_DIR"
+      docker push "$${REPO_URL}:latest"
+    EOT
+  }
+}
+
+# -----------------------------------------------------------------------------
 # Application Load Balancer
 # -----------------------------------------------------------------------------
 resource "aws_lb" "main" {
@@ -70,11 +109,12 @@ resource "aws_lb_listener" "http" {
 resource "aws_lb_target_group" "services" {
   for_each = var.services
 
-  name        = "${var.name_prefix}-${each.key}"
-  port        = each.value.port
-  protocol    = "HTTP"
-  vpc_id      = var.vpc_id
-  target_type = "ip"
+  name                 = "${var.name_prefix}-${each.key}"
+  port                 = each.value.port
+  protocol             = "HTTP"
+  vpc_id               = var.vpc_id
+  target_type          = "ip"
+  deregistration_delay = 30
 
   health_check {
     enabled             = true
@@ -175,12 +215,14 @@ resource "aws_ecs_task_definition" "services" {
   execution_role_arn       = aws_iam_role.ecs_execution.arn
   task_role_arn            = aws_iam_role.ecs_task.arn
 
+  depends_on = [null_resource.build_and_push]
+
   container_definitions = jsonencode([
     {
       name      = each.key
       image     = "${aws_ecr_repository.services[each.key].repository_url}:latest"
       essential = true
-      
+
       portMappings = [
         {
           containerPort = each.value.port
@@ -188,16 +230,17 @@ resource "aws_ecs_task_definition" "services" {
           protocol      = "tcp"
         }
       ]
-      
+
       environment = [
         { name = "SERVICE_NAME", value = each.key },
         { name = "PORT", value = tostring(each.value.port) },
-        { name = "DATABASE_URL", value = "postgresql://${var.db_endpoint}/${var.db_name}" },
+        { name = "DATABASE_URL", value = "postgresql+asyncpg://${var.db_username}:${var.db_password}@${var.db_endpoint}/${var.db_name}" },
         { name = "IOT_ENDPOINT", value = var.iot_endpoint },
         { name = "DEVICE_EVENTS_QUEUE", value = var.device_events_queue },
-        { name = "ENVIRONMENT", value = var.environment }
+        { name = "ENVIRONMENT", value = var.environment },
+        { name = "JWT_SECRET", value = var.jwt_secret }
       ]
-      
+
       logConfiguration = {
         logDriver = "awslogs"
         options = {
@@ -221,7 +264,7 @@ resource "aws_ecs_service" "services" {
   name            = each.key
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.services[each.key].arn
-  desired_count   = 1
+  desired_count   = var.desired_count
   launch_type     = "FARGATE"
 
   network_configuration {
@@ -261,8 +304,8 @@ resource "aws_iam_role" "ecs_execution" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
       Principal = { Service = "ecs-tasks.amazonaws.com" }
     }]
   })
@@ -281,8 +324,8 @@ resource "aws_iam_role" "ecs_task" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
       Principal = { Service = "ecs-tasks.amazonaws.com" }
     }]
   })
@@ -310,9 +353,10 @@ resource "aws_iam_role_policy" "ecs_task" {
       {
         Effect = "Allow"
         Action = [
-          "iot-data:Publish",
-          "iot-data:GetThingShadow",
-          "iot-data:UpdateThingShadow"
+          "iot:Publish",
+          "iot:GetThingShadow",
+          "iot:UpdateThingShadow",
+          "iot:DeleteThingShadow"
         ]
         Resource = ["*"]
       },
