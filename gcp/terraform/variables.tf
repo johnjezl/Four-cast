@@ -1,11 +1,16 @@
 # =============================================================================
-# Smart Home Hub Platform - Variables
+# Smart Home Hub Platform — GCP Variables
 # =============================================================================
 
-variable "aws_region" {
-  description = "AWS region for deployment"
+variable "gcp_project_id" {
+  description = "GCP project ID to deploy into."
   type        = string
-  default     = "us-east-1"
+}
+
+variable "gcp_region" {
+  description = "GCP region for Cloud Run, Cloud SQL, and Artifact Registry."
+  type        = string
+  default     = "us-central1"
 }
 
 variable "environment" {
@@ -17,12 +22,6 @@ variable "environment" {
     condition     = contains(["dev", "staging", "prod"], var.environment)
     error_message = "Environment must be dev, staging, or prod."
   }
-}
-
-variable "vpc_cidr" {
-  description = "CIDR block for VPC"
-  type        = string
-  default     = "10.0.0.0/16"
 }
 
 variable "db_username" {
@@ -46,35 +45,26 @@ variable "db_password" {
 # =============================================================================
 # Tuya Integration
 # =============================================================================
+# Tuya client_id / client_secret aren't wired up in this PR — they'll move
+# to Secret Manager alongside the SDK abstraction. Only the device-ID
+# allowlist is plumbed through for now.
 
 variable "tuya_device_ids" {
-  description = "Optional comma-separated allowlist of Tuya device IDs to sync. If blank, all devices discovered across the project's spaces are polled."
+  description = "Optional comma-separated allowlist of Tuya device IDs to sync."
   type        = string
   default     = ""
 }
 
-variable "tuya_client_id" {
-  description = "Tuya Cloud API client ID (leave blank if not using Tuya)"
-  type        = string
-  sensitive   = true
-}
-
-variable "tuya_client_secret" {
-  description = "Tuya Cloud API client secret (leave blank if not using Tuya)"
-  type        = string
-  sensitive   = true
-}
-
-variable "tuya_region" {
-  description = "Tuya API region (us, eu, cn, in)"
-  type        = string
-  default     = "us"
-}
-
-variable "desired_count" {
-  description = "Number of task replicas per microservice (set 2+ to demo the load balancer)"
+variable "min_instances" {
+  description = "Cloud Run min instance count per service (2+ to demo the load balancer)."
   type        = number
   default     = 2
+}
+
+variable "max_instances" {
+  description = "Cloud Run max instance count per service."
+  type        = number
+  default     = 4
 }
 
 variable "log_level" {

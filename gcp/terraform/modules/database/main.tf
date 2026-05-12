@@ -1,70 +1,57 @@
 # =============================================================================
-# Database Module (RDS PostgreSQL)
+# Cloud SQL (PostgreSQL) Module
 # =============================================================================
-# Textbook Reference: Ch. 3 - Managed services for data persistence
+# db-f1-micro keeps this in or near the free tier for short-lived demo
+# instances. Public IP is enabled because Cloud Run reaches the instance
+# via the Cloud SQL Auth Proxy, which works over the public endpoint
+# without needing a Serverless VPC Connector.
+#
+# Auth Proxy + IAM-authenticated client (per-service SAs granted
+# roles/cloudsql.client by the Cloud Run module) is what gates access —
+# no SG/firewall rules required.
 # =============================================================================
 
-resource "aws_db_subnet_group" "main" {
-  name       = "${var.name_prefix}-db-subnet"
-  subnet_ids = var.private_subnet_ids
+resource "google_sql_database_instance" "main" {
+  name             = "${var.name_prefix}-postgres"
+  database_version = "POSTGRES_15"
+  region           = var.region
 
-  tags = merge(var.common_tags, {
-    Name = "${var.name_prefix}-db-subnet"
-  })
+  deletion_protection = false
+
+  settings {
+    tier              = "db-f1-micro"
+    availability_type = "ZONAL"
+    disk_size         = 10
+    disk_type         = "PD_HDD"
+
+    backup_configuration {
+      enabled = false
+    }
+
+    ip_configuration {
+      ipv4_enabled = true
+      # No authorized_networks: access is gated by the Cloud SQL Auth
+      # Proxy + IAM on the runtime service accounts.
+    }
+  }
 }
 
-resource "aws_security_group" "database" {
-  name        = "${var.name_prefix}-db-sg"
-  description = "Security group for RDS"
-  vpc_id      = var.vpc_id
-
-  ingress {
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = var.allowed_security_groups
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = var.common_tags
+resource "google_sql_database" "main" {
+  name     = "smarthome"
+  instance = google_sql_database_instance.main.name
 }
 
-resource "aws_db_instance" "main" {
-  identifier = "${var.name_prefix}-postgres"
-
-  engine            = "postgres"
-  engine_version    = "15"
-  instance_class    = "db.t3.micro" # Free tier eligible
-  allocated_storage = 20
-  storage_type      = "gp2"
-
-  db_name  = "smarthome"
-  username = var.db_username
+resource "google_sql_user" "main" {
+  name     = var.db_username
+  instance = google_sql_database_instance.main.name
   password = var.db_password
-
-  db_subnet_group_name   = aws_db_subnet_group.main.name
-  vpc_security_group_ids = [aws_security_group.database.id]
-
-  skip_final_snapshot = true
-  publicly_accessible = false
-
-  backup_retention_period = 7
-  backup_window           = "03:00-04:00"
-  maintenance_window      = "Mon:04:00-Mon:05:00"
-
-  tags = var.common_tags
 }
 
-output "db_endpoint" {
-  value = aws_db_instance.main.endpoint
+output "connection_name" {
+  description = "Cloud SQL connection name in <project>:<region>:<instance> form. Pass to Cloud Run as cloud_sql_instance and use as ?host=/cloudsql/<connection-name> in DATABASE_URL."
+  value       = google_sql_database_instance.main.connection_name
 }
 
 output "db_name" {
-  value = aws_db_instance.main.db_name
+  value = google_sql_database.main.name
 }
