@@ -257,21 +257,21 @@ Both fields optional.
 
 ## analytics-service
 
-SLOs, developer-experience metrics, platform maturity, device telemetry.
+SLOs, developer-experience metrics, platform maturity, device telemetry. Most aggregates derive from a Postgres `event_log` table populated by a background SQS consumer that ingests every `device.*` event the platform emits.
 
 ### SLOs
 
 | Method | Path | Description |
 |---|---|---|
 | GET | `/api/v1/analytics/slos` | List SLO definitions |
-| GET | `/api/v1/analytics/slos/status` | Current status of each SLO |
+| GET | `/api/v1/analytics/slos/status` | Current status of each SLO. Response includes `"mock": true` — current values are still static placeholders until real latency/availability tracking is wired up |
 | GET | `/api/v1/analytics/slos/{id}` | Get one SLO |
 
 ### DevEx metrics
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/v1/analytics/devex` | Snapshot of headline DevEx metrics |
+| GET | `/api/v1/analytics/devex` | Snapshot of headline DevEx metrics. Each entry has `"source": "measured"` (averaged from `devex_metrics`) or `"source": "default"` (demo value) |
 | POST | `/api/v1/analytics/devex/track` | Record a metric. Query params: `metric_name`, `value`, optional `category` |
 | GET | `/api/v1/analytics/devex/recent` | Recent tracked metrics. `?limit=N&category=X` |
 
@@ -279,15 +279,15 @@ SLOs, developer-experience metrics, platform maturity, device telemetry.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/v1/analytics/maturity` | Maturity assessment by dimension |
+| GET | `/api/v1/analytics/maturity` | Maturity assessment by dimension (static seed data) |
 
 ### Device telemetry
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/v1/analytics/devices/{id}/metrics` | Time-series data. `?metric=X&hours=N` |
-| GET | `/api/v1/analytics/devices/summary` | Aggregate device stats |
-| GET | `/api/v1/analytics/usage` | Platform usage stats |
+| GET | `/api/v1/analytics/devices/{id}/metrics` | Events for a device. `?event_type=device.state_changed&hours=N` (1-168) |
+| GET | `/api/v1/analytics/devices/summary` | Live device counts (via device-service) + command/automation counts today |
+| GET | `/api/v1/analytics/usage` | Event volume and top event types over the last 24h / 7d |
 
 ---
 
