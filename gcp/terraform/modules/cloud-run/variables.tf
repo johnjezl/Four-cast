@@ -68,6 +68,21 @@ variable "tuya_device_ids" {
   default     = ""
 }
 
+variable "event_topic" {
+  description = "Short name of the Pub/Sub topic device-service publishes to."
+  type        = string
+}
+
+variable "event_subscription" {
+  description = "Short name of the Pub/Sub subscription analytics-service pulls from."
+  type        = string
+}
+
+variable "tuya_secret_name" {
+  description = "Short name of the Secret Manager secret holding Tuya creds. Read by tuya-bridge only."
+  type        = string
+}
+
 variable "min_instances" {
   description = "Minimum number of warm instances per service. 2+ to demo the load balancer."
   type        = number

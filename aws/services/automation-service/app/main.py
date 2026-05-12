@@ -29,10 +29,6 @@ from .db import async_session, engine, get_session, init_db
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger(__name__)
 
-DEVICE_EVENTS_QUEUE = os.getenv("DEVICE_EVENTS_QUEUE", "")
-IOT_ENDPOINT = os.getenv("IOT_ENDPOINT", "")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-
 
 # =============================================================================
 # Models

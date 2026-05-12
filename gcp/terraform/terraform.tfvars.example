@@ -15,10 +15,13 @@ db_password = "CHANGE_ME_STRONG_PASSWORD"
 # =============================================================================
 # Tuya Integration
 # =============================================================================
-# tuya_client_id / tuya_client_secret aren't wired through yet — they'll
-# land alongside Secret Manager + the SDK abstraction. Only the device
-# allowlist is plumbed through for now.
-tuya_device_ids = ""
+# Get these from: https://iot.tuya.com → Cloud → Development → Your Project
+# Leave blank if not integrating with Tuya — services will still deploy,
+# tuya-bridge will just fail when called.
+tuya_client_id     = ""
+tuya_client_secret = ""
+tuya_region        = "us" # us, eu, cn, in
+tuya_device_ids    = ""
 
 # =============================================================================
 # Cloud Run sizing

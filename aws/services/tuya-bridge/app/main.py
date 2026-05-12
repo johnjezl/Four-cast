@@ -26,10 +26,11 @@ from typing import Optional
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-import boto3
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
+
+from shared.cloud import secret_store
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger(__name__)
@@ -43,9 +44,6 @@ DEVICE_SERVICE_URL = os.getenv("DEVICE_SERVICE_URL", "").rstrip("/")
 INTERNAL_TOKEN = os.getenv("INTERNAL_TOKEN", "")
 TUYA_DEVICE_IDS = os.getenv("TUYA_DEVICE_IDS", "").strip()
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-
-secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
 
 
 # =============================================================================
@@ -339,8 +337,7 @@ _tuya_singleton: Optional[TuyaCloud] = None
 def get_tuya_credentials() -> dict:
     if not SECRET_NAME:
         raise RuntimeError("SECRET_NAME environment variable not set")
-    response = secrets_client.get_secret_value(SecretId=SECRET_NAME)
-    return json.loads(response["SecretString"])
+    return json.loads(secret_store().get(SECRET_NAME))
 
 
 def get_tuya_client() -> TuyaCloud:

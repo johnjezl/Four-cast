@@ -45,14 +45,34 @@ variable "db_password" {
 # =============================================================================
 # Tuya Integration
 # =============================================================================
-# Tuya client_id / client_secret aren't wired up in this PR — they'll move
-# to Secret Manager alongside the SDK abstraction. Only the device-ID
-# allowlist is plumbed through for now.
+# Tuya credentials live in Secret Manager and are read by tuya-bridge at
+# startup. Granting access is scoped to that one service via the cloud-
+# run module's per-service runtime SA.
 
 variable "tuya_device_ids" {
   description = "Optional comma-separated allowlist of Tuya device IDs to sync."
   type        = string
   default     = ""
+}
+
+variable "tuya_client_id" {
+  description = "Tuya Cloud API client ID (leave blank if not using Tuya)."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "tuya_client_secret" {
+  description = "Tuya Cloud API client secret (leave blank if not using Tuya)."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "tuya_region" {
+  description = "Tuya API region (us, eu, cn, in)."
+  type        = string
+  default     = "us"
 }
 
 variable "min_instances" {

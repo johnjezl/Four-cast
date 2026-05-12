@@ -24,9 +24,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
 
-import boto3
 import httpx
-from botocore.exceptions import ClientError
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -35,6 +33,8 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import Field, SQLModel, select
+
+from shared.cloud import event_bus
 
 from .db import async_session, engine, get_session, init_db
 
@@ -45,24 +45,22 @@ logger = logging.getLogger(__name__)
 # Configuration
 # =============================================================================
 
-DEVICE_EVENTS_QUEUE = os.getenv("DEVICE_EVENTS_QUEUE", "")
 DEVICE_SERVICE_URL = os.getenv("DEVICE_SERVICE_URL", "").rstrip("/")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
 # Rolling window used by /devex for the "measured" average. Older
 # samples are intentionally excluded so a year-old reading doesn't
 # weight today's number.
 DEVEX_WINDOW = timedelta(days=30)
 
-sqs_client = None
+_event_bus = None
 http_client: Optional[httpx.AsyncClient] = None
 
 
-def get_sqs_client():
-    global sqs_client
-    if sqs_client is None:
-        sqs_client = boto3.client("sqs", region_name=AWS_REGION)
-    return sqs_client
+def get_event_bus():
+    global _event_bus
+    if _event_bus is None:
+        _event_bus = event_bus()
+    return _event_bus
 
 
 # =============================================================================
@@ -176,68 +174,52 @@ SLO_CURRENT_METRICS = {
 
 
 # =============================================================================
-# SQS consumer
+# Event consumer
 # =============================================================================
 
 async def consume_events_once() -> int:
-    """One poll cycle against the device_events queue. Returns the number
-    of messages successfully written to event_log. Failures are logged
-    and left on the queue — SQS visibility timeout + the redrive policy
-    handle retries and dead-lettering.
+    """One poll cycle against the event bus. Returns the number of
+    messages successfully written to event_log. Failures are logged and
+    NOT ack'd — the bus's visibility timeout / ack deadline resurfaces
+    them, with the cloud-side dead-letter policy taking over after the
+    redelivery cap.
 
     Per-message commits (not a batch commit) are deliberate: one poison
     message in a batch shouldn't roll back the other nine. Don't
     "optimize" by moving the commit outside the loop.
 
-    Operator note: with desired_count > 1, multiple analytics replicas
-    consume from the same queue. SQS distributes; the DLQ redrive
-    threshold (maxReceiveCount=3) is per-message and counts across all
-    replicas, so transient errors across instances can DLQ faster than
-    expected.
+    Operator note: with multiple analytics replicas all pulling from the
+    same subscription, the cloud distributes messages between them. The
+    redelivery cap is per-message and counts across all replicas, so
+    transient errors across instances can DLQ faster than expected.
     """
-    client = get_sqs_client()
-    if not client or not DEVICE_EVENTS_QUEUE:
-        # Service can still serve read endpoints; just don't consume.
-        await asyncio.sleep(10)
-        return 0
-
-    try:
-        resp = await asyncio.to_thread(
-            client.receive_message,
-            QueueUrl=DEVICE_EVENTS_QUEUE,
-            MaxNumberOfMessages=10,
-            WaitTimeSeconds=10,
-        )
-    except ClientError as e:
-        logger.error(f"SQS receive failed: {e}")
-        await asyncio.sleep(5)
-        return 0
-
-    messages = resp.get("Messages", [])
-    if not messages:
+    bus = get_event_bus()
+    events = await bus.receive(max_messages=10, wait_seconds=10)
+    if not events:
         return 0
 
     processed = 0
     async with async_session() as session:
-        for msg in messages:
+        for ev in events:
             try:
-                body = json.loads(msg["Body"])
+                body = ev.body
                 source_ts: Optional[datetime] = None
                 if "timestamp" in body:
                     try:
                         # TODO: device-service emits datetime.utcnow().isoformat().
-                        # If another producer joins this queue with a different
+                        # If another producer joins this bus with a different
                         # timestamp format, we'll silently drop source_timestamp.
                         source_ts = datetime.fromisoformat(body["timestamp"])
                     except ValueError:
                         pass
 
-                # Use the SQS MessageId as the primary key. SQS guarantees
-                # at-least-once delivery; if a redelivery slips past our
-                # delete, ON CONFLICT DO NOTHING keeps the insert idempotent
-                # rather than creating duplicate rows.
+                # Use the bus's stable message id as the primary key.
+                # Both SQS and Pub/Sub guarantee at-least-once delivery;
+                # if a redelivery slips past our ack, ON CONFLICT DO
+                # NOTHING keeps the insert idempotent rather than
+                # creating duplicate rows.
                 stmt = pg_insert(EventLog).values(
-                    id=msg["MessageId"],
+                    id=ev.id,
                     event_type=body.get("event_type", "unknown"),
                     device_id=body.get("device_id"),
                     device_name=body.get("device_name"),
@@ -250,21 +232,14 @@ async def consume_events_once() -> int:
             except Exception as e:
                 logger.error(f"Failed to persist event: {e}")
                 await session.rollback()
-                # Don't delete from SQS — visibility timeout will resurface it.
+                # Don't ack — bus will resurface the message.
                 continue
 
-            try:
-                await asyncio.to_thread(
-                    client.delete_message,
-                    QueueUrl=DEVICE_EVENTS_QUEUE,
-                    ReceiptHandle=msg["ReceiptHandle"],
-                )
-                processed += 1
-            except ClientError as e:
-                # Already persisted; the delete failure means the message
-                # will resurface. The ON CONFLICT guard above makes the
-                # retry insert a no-op, so no duplicate row.
-                logger.warning(f"SQS delete failed (will re-receive): {e}")
+            # Persistence succeeded; ack so the bus won't redeliver.
+            # If ack fails the message will reappear; the ON CONFLICT
+            # guard makes the retry insert a no-op (no duplicate row).
+            await bus.ack(ev.ack_token)
+            processed += 1
 
     return processed
 
@@ -294,10 +269,10 @@ async def lifespan(app: FastAPI):
     logger.info("Analytics Service starting...")
     await init_db()
     consumer_task = asyncio.create_task(consume_events_forever())
-    if DEVICE_EVENTS_QUEUE:
-        logger.info("Event consumer started; polling %s", DEVICE_EVENTS_QUEUE)
-    else:
-        logger.warning("DEVICE_EVENTS_QUEUE not configured; consumer will idle")
+    logger.info(
+        "Event consumer started (provider=%s)",
+        os.environ.get("CLOUD_PROVIDER", "none"),
+    )
     try:
         yield
     finally:
@@ -342,7 +317,7 @@ async def info():
         "instance": socket.gethostname(),
         "version": "3.0.0",
         "integrations": {
-            "device_events_queue": bool(DEVICE_EVENTS_QUEUE),
+            "event_bus": os.environ.get("CLOUD_PROVIDER", "none"),
             "device_service": bool(DEVICE_SERVICE_URL),
         },
         "slos_defined": len(slos_db),

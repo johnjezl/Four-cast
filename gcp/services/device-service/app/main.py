@@ -20,9 +20,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Callable, Optional
 
-import boto3
 import httpx
-from botocore.exceptions import ClientError
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field as PydanticField
@@ -31,6 +29,8 @@ from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import Field, SQLModel, select
+
+from shared.cloud import event_bus
 
 from .db import engine, get_session, init_db
 
@@ -41,10 +41,8 @@ logger = logging.getLogger(__name__)
 # Configuration
 # =============================================================================
 
-DEVICE_EVENTS_QUEUE = os.getenv("DEVICE_EVENTS_QUEUE", "")
 TUYA_BRIDGE_URL = os.getenv("TUYA_BRIDGE_URL", "").rstrip("/")
 INTERNAL_TOKEN = os.getenv("INTERNAL_TOKEN", "")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
 # Retry policy for stuck desired-state commands. The tuya-bridge polls
 # /internal/pending each tick; this endpoint filters by these bounds so a
@@ -52,15 +50,15 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 PENDING_MAX_RETRIES = int(os.getenv("PENDING_MAX_RETRIES", "5"))
 PENDING_BACKOFF_SECONDS = int(os.getenv("PENDING_BACKOFF_SECONDS", "60"))
 
-sqs_client = None
+_event_bus = None
 http_client: Optional[httpx.AsyncClient] = None
 
 
-def get_sqs_client():
-    global sqs_client
-    if sqs_client is None:
-        sqs_client = boto3.client("sqs", region_name=AWS_REGION)
-    return sqs_client
+def get_event_bus():
+    global _event_bus
+    if _event_bus is None:
+        _event_bus = event_bus()
+    return _event_bus
 
 
 # =============================================================================
@@ -399,13 +397,11 @@ async def dispatch_command(tuya_device_id: str, desired: dict) -> None:
 
 
 # =============================================================================
-# SQS event publishing
+# Event publishing
 # =============================================================================
 
 async def publish_device_event(event_type: str, device: Device, data: dict = None):
-    client = get_sqs_client()
-    if not client or not DEVICE_EVENTS_QUEUE:
-        return
+    bus = get_event_bus()
     message = {
         "event_type": event_type,
         "device_id": device.id,
@@ -414,15 +410,8 @@ async def publish_device_event(event_type: str, device: Device, data: dict = Non
         "data": data or {},
     }
     try:
-        await asyncio.to_thread(
-            client.send_message,
-            QueueUrl=DEVICE_EVENTS_QUEUE,
-            MessageBody=json.dumps(message),
-            MessageAttributes={
-                "event_type": {"DataType": "String", "StringValue": event_type}
-            },
-        )
-    except ClientError as e:
+        await bus.publish(message, attributes={"event_type": event_type})
+    except Exception as e:  # noqa: BLE001
         logger.error(f"Error publishing event: {e}")
 
 
@@ -506,7 +495,7 @@ async def service_info(session: AsyncSession = Depends(get_session)):
         "version": "3.0.0",
         "integrations": {
             "tuya_bridge": bool(TUYA_BRIDGE_URL),
-            "sqs_events": bool(DEVICE_EVENTS_QUEUE),
+            "event_bus": os.environ.get("CLOUD_PROVIDER", "none"),
         },
         "device_count": len(devices),
         "device_types": len(device_types_db),

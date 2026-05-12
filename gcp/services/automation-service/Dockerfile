@@ -1,7 +1,11 @@
+# Build context is the repo root so we can pull in shared/.
+# Build with: docker build -f gcp/services/automation-service/Dockerfile <repo-root>
 FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt .
+WORKDIR /srv
+COPY gcp/services/automation-service/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app/ ./app/
+COPY shared/ ./shared/
+COPY gcp/services/automation-service/app/ ./app/
+ENV PYTHONPATH=/srv
 EXPOSE 8002
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8002"]

@@ -31,6 +31,8 @@ resource "null_resource" "build_and_push" {
 
   triggers = {
     image_url = local.image_urls[each.key]
+    # Trigger covers the per-service source AND shared/ — edits to the
+    # cloud abstraction layer must rebuild every image.
     src_hash = sha256(join("|", concat(
       [for f in fileset("${path.root}/../services/${each.key}", "app/**/*.py") :
       "${f}=${filesha256("${path.root}/../services/${each.key}/${f}")}"],
@@ -38,6 +40,8 @@ resource "null_resource" "build_and_push" {
       "${f}=${filesha256("${path.root}/../services/${each.key}/${f}")}"],
       [for f in fileset("${path.root}/../services/${each.key}", "requirements.txt") :
       "${f}=${filesha256("${path.root}/../services/${each.key}/${f}")}"],
+      [for f in fileset("${path.root}/../../shared", "**/*.py") :
+      "shared/${f}=${filesha256("${path.root}/../../shared/${f}")}"],
     )))
   }
 
@@ -47,11 +51,12 @@ resource "null_resource" "build_and_push" {
       set -e
       IMAGE_URL="${local.image_urls[each.key]}"
       REGISTRY="${local.registry_host}"
-      SERVICE_DIR="${path.root}/../services/${each.key}"
+      REPO_ROOT="${path.root}/../.."
+      DOCKERFILE="gcp/services/${each.key}/Dockerfile"
 
       echo ">>> Building and pushing $${IMAGE_URL}"
       gcloud auth configure-docker "$REGISTRY" --quiet >/dev/null
-      docker build -t "$IMAGE_URL" "$SERVICE_DIR"
+      docker build -t "$IMAGE_URL" -f "$REPO_ROOT/$DOCKERFILE" "$REPO_ROOT"
       docker push "$IMAGE_URL"
     EOT
   }

@@ -47,6 +47,8 @@ resource "null_resource" "build_and_push" {
 
   triggers = {
     repo_url = aws_ecr_repository.services[each.key].repository_url
+    # Trigger covers the per-service source AND shared/ — edits to the
+    # cloud abstraction layer must rebuild every image.
     src_hash = sha256(join("|", concat(
       [for f in fileset("${path.root}/../services/${each.key}", "app/**/*.py") :
       "${f}=${filesha256("${path.root}/../services/${each.key}/${f}")}"],
@@ -54,6 +56,8 @@ resource "null_resource" "build_and_push" {
       "${f}=${filesha256("${path.root}/../services/${each.key}/${f}")}"],
       [for f in fileset("${path.root}/../services/${each.key}", "requirements.txt") :
       "${f}=${filesha256("${path.root}/../services/${each.key}/${f}")}"],
+      [for f in fileset("${path.root}/../../shared", "**/*.py") :
+      "shared/${f}=${filesha256("${path.root}/../../shared/${f}")}"],
     )))
   }
 
@@ -63,13 +67,14 @@ resource "null_resource" "build_and_push" {
       set -e
       REPO_URL="${aws_ecr_repository.services[each.key].repository_url}"
       REGISTRY="$${REPO_URL%%/*}"
-      SERVICE_DIR="${path.root}/../services/${each.key}"
+      REPO_ROOT="${path.root}/../.."
+      DOCKERFILE="aws/services/${each.key}/Dockerfile"
       REGION="${data.aws_region.current.name}"
 
       echo ">>> Building and pushing $${REPO_URL}:latest"
       aws ecr get-login-password --region "$REGION" | \
         docker login --username AWS --password-stdin "$REGISTRY" >/dev/null
-      docker build -t "$${REPO_URL}:latest" "$SERVICE_DIR"
+      docker build -t "$${REPO_URL}:latest" -f "$REPO_ROOT/$DOCKERFILE" "$REPO_ROOT"
       docker push "$${REPO_URL}:latest"
     EOT
   }
@@ -236,6 +241,7 @@ resource "aws_ecs_task_definition" "services" {
       ]
 
       environment = [
+        { name = "CLOUD_PROVIDER", value = "aws" },
         { name = "SERVICE_NAME", value = each.key },
         { name = "PORT", value = tostring(each.value.port) },
         { name = "DATABASE_URL", value = "postgresql+asyncpg://${var.db_username}:${var.db_password}@${var.db_endpoint}/${var.db_name}" },

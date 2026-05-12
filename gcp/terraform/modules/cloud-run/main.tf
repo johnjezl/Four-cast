@@ -115,6 +115,29 @@ resource "google_cloud_run_v2_service" "main" {
         failure_threshold = 3
       }
 
+      # shared.cloud picks the GCP adapter (Pub/Sub + Secret Manager)
+      # based on CLOUD_PROVIDER. The adapter reads EVENT_TOPIC /
+      # EVENT_SUBSCRIPTION / GCP_PROJECT from the env.
+      env {
+        name  = "CLOUD_PROVIDER"
+        value = "gcp"
+      }
+      env {
+        name  = "GCP_PROJECT"
+        value = var.project_id
+      }
+      env {
+        name  = "EVENT_TOPIC"
+        value = var.event_topic
+      }
+      env {
+        name  = "EVENT_SUBSCRIPTION"
+        value = var.event_subscription
+      }
+      env {
+        name  = "SECRET_NAME"
+        value = var.tuya_secret_name
+      }
       env {
         name  = "SERVICE_NAME"
         value = each.key
