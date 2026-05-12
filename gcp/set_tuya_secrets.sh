@@ -1,28 +1,27 @@
 #!/bin/bash
 # =============================================================================
-# Set Tuya credentials in AWS Secrets Manager
+# Set Tuya credentials in GCP Secret Manager
 # =============================================================================
-# Updates the secret read by both Lambda functions (tuya-poller and
-# tuya-command) at invocation time.
+# Updates the secret read by tuya-bridge at container start.
 #
 # Usage:
-#   bash ./aws/set_tuya_secrets.sh                  # prompts interactively
+#   bash ./gcp/set_tuya_secrets.sh                  # prompts interactively
 #   TUYA_CLIENT_ID=... TUYA_CLIENT_SECRET=... \
-#     bash ./aws/set_tuya_secrets.sh                # non-interactive
+#     bash ./gcp/set_tuya_secrets.sh                # non-interactive
 #
 # Env vars:
 #   TUYA_CLIENT_ID       Tuya Access ID (prompted if unset)
 #   TUYA_CLIENT_SECRET   Tuya Access Secret (prompted if unset)
 #   TUYA_REGION          Tuya datacenter: us|eu|cn|in (default: us)
 #   ENVIRONMENT          smarthome env name (default: dev)
-#   AWS_REGION           AWS region (default: from `aws configure get region`)
+#   GCP_PROJECT          GCP project ID (default: `gcloud config get-value project`)
 # =============================================================================
 set -e
 
 cd "$(dirname "$0")"
 
-REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region)}}"
-: "${REGION:?REGION is not set; configure AWS CLI or export AWS_REGION}"
+GCP_PROJECT="${GCP_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
+: "${GCP_PROJECT:?GCP_PROJECT not set; run 'gcloud config set project <id>' or export GCP_PROJECT}"
 
 ENVIRONMENT="${ENVIRONMENT:-dev}"
 SECRET_NAME="smarthome-${ENVIRONMENT}-tuya-credentials"
@@ -34,10 +33,9 @@ if ! command -v jq &>/dev/null; then
   exit 1
 fi
 
-if ! aws secretsmanager describe-secret \
-    --secret-id "$SECRET_NAME" \
-    --region "$REGION" &>/dev/null; then
-  echo "ERROR: Secret '$SECRET_NAME' not found in region '$REGION'."
+if ! gcloud secrets describe "$SECRET_NAME" \
+    --project="$GCP_PROJECT" &>/dev/null; then
+  echo "ERROR: Secret '$SECRET_NAME' not found in project '$GCP_PROJECT'."
   echo "Run 'terraform apply' first so the infrastructure exists."
   exit 1
 fi
@@ -59,28 +57,28 @@ SECRET_JSON=$(jq -n \
   --arg r   "$TUYA_REGION" \
   '{client_id: $cid, client_secret: $cs, region: $r}')
 
-echo "Updating ${SECRET_NAME} in ${REGION}..."
-VERSION_ID=$(aws secretsmanager put-secret-value \
-  --region "$REGION" \
-  --secret-id "$SECRET_NAME" \
-  --secret-string "$SECRET_JSON" \
-  --output text \
-  --query 'VersionId')
+echo "Adding new version to ${SECRET_NAME} in ${GCP_PROJECT}..."
+VERSION_NAME=$(printf '%s' "$SECRET_JSON" | gcloud secrets versions add "$SECRET_NAME" \
+  --project="$GCP_PROJECT" \
+  --data-file=- \
+  --format='value(name)')
 
 echo ""
-echo "Updated. New secret version: ${VERSION_ID}"
+echo "Updated. New secret version: ${VERSION_NAME}"
 echo ""
-echo "The Lambda functions read this secret on each invocation, so changes"
-echo "take effect within ~15 min as warm Lambda containers cycle out."
+echo "Cloud Run reads this secret at container start, so the running"
+echo "tuya-bridge revision will keep serving the old value. Roll out the new"
+echo "value by forcing a new revision:"
+echo ""
+echo "  gcloud run services update smarthome-${ENVIRONMENT}-tuya-bridge \\"
+echo "    --project=${GCP_PROJECT} \\"
+echo "    --region=\$GCP_REGION \\"
+echo "    --image=\$GCP_REGION-docker.pkg.dev/${GCP_PROJECT}/smarthome-${ENVIRONMENT}-services/tuya-bridge:latest"
+echo ""
+echo "  # …then follow up with 'terraform apply' so the DEVICE_SERVICE_URL"
+echo "  # patch re-fires against the new revision."
 echo ""
 echo "Verify the new value:"
-echo "  aws secretsmanager get-secret-value \\"
-echo "    --region ${REGION} \\"
-echo "    --secret-id ${SECRET_NAME} \\"
-echo "    --query SecretString --output text | jq ."
-echo ""
-echo "Force an immediate Lambda refresh (touches config to invalidate warm containers):"
-echo "  for FN in smarthome-${ENVIRONMENT}-tuya-poller smarthome-${ENVIRONMENT}-tuya-command; do"
-echo "    aws lambda update-function-configuration --region ${REGION} \\"
-echo "      --function-name \$FN --description \"refresh-\$(date +%s)\" >/dev/null"
-echo "  done"
+echo "  gcloud secrets versions access latest \\"
+echo "    --project=${GCP_PROJECT} \\"
+echo "    --secret=${SECRET_NAME} | jq ."

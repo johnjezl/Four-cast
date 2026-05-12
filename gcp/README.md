@@ -89,10 +89,24 @@ terraform taint module.cloud_run.null_resource.patch_tuya_bridge_url
 terraform apply
 ```
 
-## Still TODO
+## Operations scripts
 
-- `push_images.sh`, `redeploy.sh`, `set_tuya_secrets.sh`, and
-  `test_apis.sh` are still the AWS scripts — left as-is for now.
+- `./gcp/push_images.sh` — `docker build` + `docker push` each service
+  image to Artifact Registry. Uses the repo-root build context so
+  `shared/` gets copied in, matching the Terraform `null_resource`
+  behavior.
+- `./gcp/redeploy.sh` — forces a new Cloud Run revision per service via
+  `gcloud run services update --image=...`. After this, run
+  `terraform apply` so the `tuya-bridge` `DEVICE_SERVICE_URL` patch
+  re-fires against the new revision.
+- `./gcp/set_tuya_secrets.sh` — adds a new version to the Tuya
+  Secret Manager secret. Cloud Run reads at container start, so a
+  rollout requires forcing a new `tuya-bridge` revision (printed at the
+  end of the script).
+- `./gcp/test_apis.sh` — same flag/operation surface as the AWS
+  version; resolves per-service URLs from
+  `terraform output -json service_urls` and routes each call to the
+  matching `*.run.app` based on the `/api/v1/<service>/` path segment.
 
 ## Cost note
 
@@ -103,6 +117,24 @@ so a stack left running for a week is not free. Set `min_instances = 0`
 in `terraform.tfvars` if you don't need the load-balancer demo, and
 `terraform destroy` between demos.
 
+## Prerequisites
+
+On the machine running `terraform apply` and the ops scripts:
+
+- `terraform` ≥ 1.0, `docker`, `gcloud`, `curl`, `jq`
+- `bash` ≥ 4 (for `gcp/test_apis.sh`'s per-service URL dispatch).
+  macOS still ships 3.2 — install via `brew install bash` and invoke
+  the script as `/opt/homebrew/bin/bash ./gcp/test_apis.sh`.
+- gcloud authenticated to your account with project access:
+  ```bash
+  gcloud auth login
+  gcloud auth application-default login
+  gcloud config set project <your-project-id>
+  ```
+  `auth login` is for `gcloud` CLI commands (`push_images.sh`,
+  `redeploy.sh`, `set_tuya_secrets.sh`). `application-default login`
+  is for Terraform's google provider.
+
 ## Running it
 
 ```bash
@@ -111,15 +143,9 @@ cp terraform.tfvars.example terraform.tfvars
 # Fill in gcp_project_id, db_password, and (if using Tuya)
 # tuya_client_id / tuya_client_secret.
 
-gcloud auth application-default login
-gcloud config set project <your-project-id>
-
 terraform init
 terraform apply
 ```
-
-The build-and-push step needs `docker` + `gcloud` on the machine running
-apply (same shape as the AWS module needing `docker` + `aws`).
 
 After apply, `terraform output service_urls` returns the five public
 service URLs. Each service is reached directly at its own `*.run.app`

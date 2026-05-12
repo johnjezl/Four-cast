@@ -7,32 +7,67 @@
 #   bash ./gcp/test_apis.sh --help                   # Same as --list
 #   bash ./gcp/test_apis.sh <op> [--flag value ...]  # Run one operation
 #
-#   BASE_URL=https://...    # override the API base (default: from terraform output)
+#   SERVICE_URLS_JSON='{"device-service":"https://...","user-service":"https://...",...}'
+#                           # override per-service URLs (default: from `terraform output -json service_urls`)
 #
 # After `login`, the JWT is saved to /tmp/smarthome-jwt and re-used by subsequent
 # authenticated calls until you run `logout` or `logout-local`.
 #
-# Requires: curl, jq
+# Requires: bash 4+, curl, jq
 # =============================================================================
 set -u
 
 cd "$(dirname "$0")"
 
-# -- Resolve base URL ---------------------------------------------------------
-if [ -z "${BASE_URL:-}" ]; then
-  BASE_URL=$(cd terraform && terraform output -raw api_gateway_url 2>/dev/null || true)
-fi
-if [ -z "${BASE_URL:-}" ]; then
-  echo "ERROR: BASE_URL not set and 'terraform output api_gateway_url' returned nothing."
-  echo "Run terraform apply first, or pass BASE_URL=... explicitly."
+# Per-service URL dispatch uses associative arrays (bash 4+). macOS
+# still ships bash 3.2 by default — install a newer bash via
+# `brew install bash` and invoke as `/opt/homebrew/bin/bash ...`.
+if (( BASH_VERSINFO[0] < 4 )); then
+  echo "ERROR: bash 4+ required (you have $BASH_VERSION)."
+  echo "On macOS: brew install bash && /opt/homebrew/bin/bash $0"
   exit 1
 fi
-BASE_URL="${BASE_URL%/}"
 
 if ! command -v jq >/dev/null; then
   echo "ERROR: jq is required. Install with: sudo apt install jq"
   exit 1
 fi
+
+# -- Resolve per-service URLs -------------------------------------------------
+# GCP deploys each service to its own *.run.app URL. The terraform output
+# `service_urls` is a JSON map keyed by service name; we route each call
+# based on the second segment of the path (/api/v1/<service>/...).
+if [ -z "${SERVICE_URLS_JSON:-}" ]; then
+  SERVICE_URLS_JSON=$(cd terraform && terraform output -json service_urls 2>/dev/null || echo "")
+fi
+if [ -z "$SERVICE_URLS_JSON" ] || [ "$SERVICE_URLS_JSON" = "{}" ]; then
+  echo "ERROR: no service URLs resolved."
+  echo "Run 'terraform apply' first, or pass SERVICE_URLS_JSON=... explicitly."
+  exit 1
+fi
+
+declare -A SERVICE_URL
+while IFS=$'\t' read -r key val; do
+  SERVICE_URL["$key"]="${val%/}"
+done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' <<<"$SERVICE_URLS_JSON")
+
+# url_for_path PATH -> echoes the matching base URL.
+# Path is expected to start with /api/v1/<service>/...; <service> maps
+# to either "<service>-service" (the four main services) or "tuya-bridge"
+# (the only odd-one-out key).
+url_for_path() {
+  local path=$1
+  local seg="${path#/api/v1/}"
+  seg="${seg%%/*}"
+  if [ -n "${SERVICE_URL[${seg}-service]:-}" ]; then
+    echo "${SERVICE_URL[${seg}-service]}"
+  elif [ -n "${SERVICE_URL[$seg]:-}" ]; then
+    echo "${SERVICE_URL[$seg]}"
+  else
+    echo "ERROR: no URL for service '${seg}' (path=${path})" >&2
+    return 1
+  fi
+}
 
 # -- Output helpers -----------------------------------------------------------
 if [ -t 1 ]; then GREEN=$'\033[32m'; RED=$'\033[31m'; DIM=$'\033[2m'; RST=$'\033[0m'
@@ -49,7 +84,9 @@ TOKEN="${TOKEN:-}"
 # call METHOD PATH [EXPECTED_STATUS] [JSON_BODY]
 call() {
   local method=$1 path=$2 expected=${3:-200} body=${4:-}
-  local url="${BASE_URL}${path}"
+  local base
+  base=$(url_for_path "$path") || { FAIL=$((FAIL+1)); return; }
+  local url="${base}${path}"
   local args=(-s -o "$RESP" -w "%{http_code}" -X "$method")
   if [ -n "$body" ]; then
     args+=(-H "Content-Type: application/json" -d "$body")
@@ -362,7 +399,10 @@ EOF
 # Full test suite (no-arg mode)
 # =============================================================================
 run_all() {
-  echo "Base URL: $BASE_URL"
+  echo "Service URLs:"
+  for key in "${!SERVICE_URL[@]}"; do
+    printf "  %-20s %s\n" "$key" "${SERVICE_URL[$key]}"
+  done
 
   section "Health & info"
   call GET /api/v1/device/info
