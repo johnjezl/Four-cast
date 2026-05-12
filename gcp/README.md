@@ -14,8 +14,9 @@ sit behind `shared/cloud/`, which picks an adapter at runtime from
 | Database | RDS Postgres in private subnets | Cloud SQL Postgres, via the Cloud SQL Auth Proxy |
 | Event bus | SQS queue + DLQ + redrive | Pub/Sub topic + subscription + dead-letter topic |
 | Secrets (Tuya) | Secrets Manager, scoped task role | Secret Manager, scoped `secretAccessor` on tuya-bridge SA |
+| Secrets (JWT + INTERNAL_TOKEN) | Secrets Manager via task definition `secrets` block | Secret Manager via Cloud Run `env.value_source.secret_key_ref`; all five SAs granted `secretAccessor` |
 | Service identity | One ECS task role + scoped tuya-bridge role | One `google_service_account` per service |
-| Inbound auth | API Gateway in front of ALB | Direct invocation; `allUsers` invoker except tuya-bridge (device-service SA only) |
+| Inbound auth | API Gateway in front of ALB | Direct invocation; `allUsers` invoker on every service. App-level `INTERNAL_TOKEN` gates inter-service calls |
 
 No VPC / networking module — Cloud Run is fully managed and reaches
 Cloud SQL through the Auth Proxy's unix socket, so a Serverless VPC
@@ -62,12 +63,34 @@ service-code change we deferred. App-level `INTERNAL_TOKEN` remains
 the real auth boundary, matching the AWS setup where the ALB is
 public.
 
+## Rotating `JWT_SECRET` / `INTERNAL_TOKEN`
+
+The secrets are read by Cloud Run *at container start* (via
+`value_source.secret_key_ref` pointing at version `"latest"`).
+Creating a new secret version doesn't recycle running containers —
+they keep serving the old value cached at startup. A full rotation
+is two steps:
+
+```bash
+# 1. Bump the secret values (new random_password -> new secret version)
+terraform taint random_password.jwt_secret
+terraform taint random_password.internal_token
+terraform apply
+
+# 2. Force a new revision per service so the new values get fetched.
+#    For the four main services, tainting the Cloud Run resources is
+#    enough. For tuya-bridge, also taint the null_resource so the
+#    DEVICE_SERVICE_URL patch reapplies on the new revision.
+for svc in device-service automation-service user-service analytics-service; do
+  terraform taint 'module.cloud_run.google_cloud_run_v2_service.main["'"$svc"'"]'
+done
+terraform taint module.cloud_run.google_cloud_run_v2_service.tuya_bridge
+terraform taint module.cloud_run.null_resource.patch_tuya_bridge_url
+terraform apply
+```
+
 ## Still TODO
 
-- **`JWT_SECRET` / `INTERNAL_TOKEN`** are plain Cloud Run env vars; AWS
-  pulls them from Secrets Manager via the ECS task definition's
-  `secrets` block. The GCP equivalent (Secret Manager + Cloud Run
-  secret env volumes) is mechanical but not done in this PR.
 - `push_images.sh`, `redeploy.sh`, `set_tuya_secrets.sh`, and
   `test_apis.sh` are still the AWS scripts — left as-is for now.
 

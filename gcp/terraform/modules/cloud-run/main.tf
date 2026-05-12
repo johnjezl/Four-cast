@@ -42,6 +42,38 @@ resource "google_project_iam_member" "cloud_sql_client" {
   member  = "serviceAccount:${google_service_account.services[each.key].email}"
 }
 
+# App-secret access. Every runtime SA needs to read JWT_SECRET (each
+# service validates JWTs) and INTERNAL_TOKEN (every service-to-service
+# call is gated by it). Bindings live inside the module so the Cloud
+# Run resources below can depend_on them — Cloud Run waits for the
+# first revision to be READY at create time, and the container can't
+# become READY without secret access, so the IAM has to land first.
+locals {
+  app_secret_grants = flatten([
+    for sa_key, sa in google_service_account.services : [
+      {
+        key       = "${sa_key}-jwt"
+        sa_email  = sa.email
+        secret_id = var.jwt_secret_id
+      },
+      {
+        key       = "${sa_key}-internal"
+        sa_email  = sa.email
+        secret_id = var.internal_token_id
+      },
+    ]
+  ])
+}
+
+resource "google_secret_manager_secret_iam_member" "app_secrets" {
+  for_each = { for g in local.app_secret_grants : g.key => g }
+
+  project   = var.project_id
+  secret_id = each.value.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${each.value.sa_email}"
+}
+
 # -----------------------------------------------------------------------------
 # Shared template config
 # -----------------------------------------------------------------------------
@@ -51,6 +83,11 @@ resource "google_project_iam_member" "cloud_sql_client" {
 # in each resource — kept out of locals to avoid forward-reference
 # cycles.
 locals {
+  # Plain env vars shared by every container. Secrets (JWT_SECRET,
+  # INTERNAL_TOKEN) are NOT here — they're added separately as static
+  # env blocks below with value_source.secret_key_ref. Cloud Run's env
+  # block can carry either `value` or `value_source`, never both, so we
+  # have to keep the two flavors in separate blocks.
   base_env = [
     { name = "CLOUD_PROVIDER", value = "gcp" },
     { name = "GCP_PROJECT", value = var.project_id },
@@ -60,8 +97,6 @@ locals {
     { name = "ENVIRONMENT", value = var.environment },
     { name = "LOG_LEVEL", value = var.log_level },
     { name = "DATABASE_URL", value = "postgresql+asyncpg://${var.db_username}:${var.db_password}@/${var.db_name}?host=/cloudsql/${var.db_connection_name}" },
-    { name = "JWT_SECRET", value = var.jwt_secret },
-    { name = "INTERNAL_TOKEN", value = var.internal_token },
     { name = "TUYA_DEVICE_IDS", value = var.tuya_device_ids },
   ]
 }
@@ -75,6 +110,14 @@ resource "google_cloud_run_v2_service" "main" {
   name     = "${var.name_prefix}-${each.key}"
   location = var.region
   ingress  = "INGRESS_TRAFFIC_ALL"
+
+  # IAM must exist before the first revision tries to start, otherwise
+  # the container fails to fetch its secret and Cloud Run times out
+  # marking the revision READY.
+  depends_on = [
+    google_secret_manager_secret_iam_member.app_secrets,
+    google_project_iam_member.cloud_sql_client,
+  ]
 
   template {
     service_account = google_service_account.services[each.key].email
@@ -150,6 +193,29 @@ resource "google_cloud_run_v2_service" "main" {
         }
       }
 
+      # JWT_SECRET and INTERNAL_TOKEN are pulled from Secret Manager at
+      # container start. The runtime SA needs roles/secretmanager.
+      # secretAccessor on both secrets (granted in gcp/terraform/main.tf).
+      # Mirrors the AWS task definition's `secrets` block.
+      env {
+        name = "JWT_SECRET"
+        value_source {
+          secret_key_ref {
+            secret  = var.jwt_secret_id
+            version = "latest"
+          }
+        }
+      }
+      env {
+        name = "INTERNAL_TOKEN"
+        value_source {
+          secret_key_ref {
+            secret  = var.internal_token_id
+            version = "latest"
+          }
+        }
+      }
+
       env {
         name  = "SERVICE_NAME"
         value = each.key
@@ -202,6 +268,12 @@ resource "google_cloud_run_v2_service" "tuya_bridge" {
   name     = "${var.name_prefix}-tuya-bridge"
   location = var.region
   ingress  = "INGRESS_TRAFFIC_ALL"
+
+  # Same IAM-before-revision-start ordering as main[*].
+  depends_on = [
+    google_secret_manager_secret_iam_member.app_secrets,
+    google_project_iam_member.cloud_sql_client,
+  ]
 
   template {
     service_account = google_service_account.services["tuya-bridge"].email
@@ -263,6 +335,26 @@ resource "google_cloud_run_v2_service" "tuya_bridge" {
         content {
           name  = env.value.name
           value = env.value.value
+        }
+      }
+
+      # Same Secret Manager-backed env as the main services.
+      env {
+        name = "JWT_SECRET"
+        value_source {
+          secret_key_ref {
+            secret  = var.jwt_secret_id
+            version = "latest"
+          }
+        }
+      }
+      env {
+        name = "INTERNAL_TOKEN"
+        value_source {
+          secret_key_ref {
+            secret  = var.internal_token_id
+            version = "latest"
+          }
         }
       }
 

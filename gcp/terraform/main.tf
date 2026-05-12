@@ -93,17 +93,53 @@ locals {
 }
 
 # =============================================================================
-# Shared application secrets (still plain values for now)
+# Shared application secrets (Secret Manager-backed)
 # =============================================================================
+# JWT signing secret + service-to-service auth token live in Secret
+# Manager. Cloud Run fetches them at container start via the env block's
+# `value_source.secret_key_ref` (see modules/cloud-run/main.tf), mirroring
+# the AWS task definition's `secrets` block.
+#
+# Both rotate on `terraform taint random_password.<name>`; services pick
+# up the new version on next deploy.
 resource "random_password" "jwt_secret" {
   length  = 48
   special = false
+}
+
+resource "google_secret_manager_secret" "jwt_secret" {
+  secret_id = "${local.name_prefix}-jwt-secret"
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_version" "jwt_secret" {
+  secret      = google_secret_manager_secret.jwt_secret.id
+  secret_data = random_password.jwt_secret.result
 }
 
 resource "random_password" "internal_token" {
   length  = 48
   special = false
 }
+
+resource "google_secret_manager_secret" "internal_token" {
+  secret_id = "${local.name_prefix}-internal-token"
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_version" "internal_token" {
+  secret      = google_secret_manager_secret.internal_token.id
+  secret_data = random_password.internal_token.result
+}
+
+# IAM for these two secrets lives inside the cloud-run module (see
+# modules/cloud-run/main.tf — google_secret_manager_secret_iam_member.
+# app_secrets). The Cloud Run service resources depend_on those grants
+# so the first revision can't try to start before the IAM lands.
 
 # =============================================================================
 # Pub/Sub: device-events bus
@@ -254,9 +290,9 @@ module "cloud_run" {
   db_username        = var.db_username
   db_password        = var.db_password
 
-  jwt_secret      = random_password.jwt_secret.result
-  internal_token  = random_password.internal_token.result
-  tuya_device_ids = var.tuya_device_ids
+  jwt_secret_id     = google_secret_manager_secret.jwt_secret.secret_id
+  internal_token_id = google_secret_manager_secret.internal_token.secret_id
+  tuya_device_ids   = var.tuya_device_ids
 
   event_topic        = google_pubsub_topic.device_events.name
   event_subscription = google_pubsub_subscription.device_events.name

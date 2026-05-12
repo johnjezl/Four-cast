@@ -50,16 +50,14 @@ variable "db_password" {
   sensitive = true
 }
 
-variable "jwt_secret" {
-  description = "JWT signing secret. Plain env var for now; move to Secret Manager when we tighten IAM."
+variable "jwt_secret_id" {
+  description = "Short ID of the Secret Manager secret holding the JWT signing secret. Cloud Run fetches the latest version at container start via value_source.secret_key_ref."
   type        = string
-  sensitive   = true
 }
 
-variable "internal_token" {
-  description = "Shared service-to-service auth token. Plain env var for now."
+variable "internal_token_id" {
+  description = "Short ID of the Secret Manager secret holding the service-to-service auth token."
   type        = string
-  sensitive   = true
 }
 
 variable "tuya_device_ids" {
