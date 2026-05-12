@@ -135,6 +135,48 @@ plumbing.
   to force new revisions. The GCP rotation runbook in `gcp/README.md`
   is the template — adapt the `gcloud` commands to `az`.
 
+- **`terraform destroy` ordering needs help in two places.** Both
+  surfaced on the first real GCP teardown:
+
+  1. *Compute → DB connection drain.* The Container App / Cloud Run
+     delete API returns success before all sessions on the Postgres
+     side are actually closed. We tried three passive approaches and
+     all of them failed on real teardowns:
+     - `time_sleep` alone — even 180s wasn't enough.
+     - Aggressive `tcp_keepalives_idle/interval/count` via
+       `database_flags`, so Postgres reaps dead sessions in ~90s
+       instead of the default 2 hours.
+     - Both combined.
+
+     The sessions Cloud Run leaves behind aren't always "dead" in a
+     way TCP keepalives detect — sometimes the kernel never sends
+     RST/FIN. The only reliable fix is **active** session
+     termination: restart the SQL instance immediately before the DB
+     drop. A restart kills every session unconditionally and takes
+     ~30s. By the time it fires, the compute layer is already gone,
+     so nothing reconnects. See
+     `null_resource.terminate_db_connections` in
+     `gcp/terraform/modules/database/main.tf` (a destroy-time
+     `local-exec` that runs `gcloud sql instances restart`). For
+     Azure, the equivalent is `az postgres flexible-server restart`.
+
+     A short `time_sleep` (30s) between compute teardown and the
+     restart is still useful as a buffer in case the platform's
+     container cleanup lags the API "deleted" signal. The
+     `tcp_keepalives_*` flags are also worth keeping — they don't fix
+     this scenario but they help reap dead sessions in normal
+     operation (dev-machine disconnects, network blips).
+
+  2. *DB user owns DB objects.* `google_sql_database` and
+     `google_sql_user` (or their Azure equivalents) are siblings under
+     the instance and Terraform destroys them in parallel. Postgres
+     refuses to drop a role that still owns schema objects, so
+     whichever finishes first determines whether the role-drop sees
+     an empty database. Add `depends_on = [<db_user>]` on the
+     database resource to force user → database create order, which
+     reverses to database → user on destroy. See
+     `gcp/terraform/modules/database/main.tf`.
+
 - **Build context = repo root.** Service Dockerfiles need to `COPY
   shared/` into the image, so every `docker build` must run from the
   repo root with `-f azure/services/<svc>/Dockerfile`. Otherwise

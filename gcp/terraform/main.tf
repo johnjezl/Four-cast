@@ -36,6 +36,10 @@ terraform {
       source  = "hashicorp/null"
       version = "~> 3.2"
     }
+    time = {
+      source  = "hashicorp/time"
+      version = "~> 0.11"
+    }
   }
 }
 
@@ -272,6 +276,18 @@ module "database" {
   db_password = var.db_password
 }
 
+# Small buffer between Cloud Run teardown and the Cloud SQL instance
+# restart that the database module triggers next (see
+# null_resource.terminate_db_connections in modules/database/main.tf).
+# Terraform already waits for Cloud Run delete operations to complete,
+# so this is just a margin in case container cleanup lags behind the
+# API "deleted" signal. The actual session reaping is done by the
+# instance restart, not by waiting. No-op on apply.
+resource "time_sleep" "cloud_run_drain" {
+  depends_on       = [module.database]
+  destroy_duration = "30s"
+}
+
 # =============================================================================
 # Cloud Run services
 # =============================================================================
@@ -301,6 +317,8 @@ module "cloud_run" {
   min_instances = var.min_instances
   max_instances = var.max_instances
   log_level     = var.log_level
+
+  depends_on = [time_sleep.cloud_run_drain]
 }
 
 # =============================================================================
