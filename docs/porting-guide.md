@@ -1,0 +1,153 @@
+# Porting the SmartHome Hub to a new cloud
+
+Quick guide for adding a third cloud (Azure, OCI, whatever) alongside
+`aws/` and `gcp/`. Reading time: 5 minutes. Implementation time: 2–4
+focused days including review cycles and a real-cloud smoke test —
+the GCP port spanned six PRs and a few novel issues surfaced only on
+first real apply.
+
+## What's already abstracted
+
+Service code (`*/services/*/app/`) is **identical** between AWS and
+GCP. The only cloud-specific surface lives behind two protocols in
+`shared/cloud/`:
+
+| Protocol | What it does | AWS impl | GCP impl |
+|---|---|---|---|
+| `EventBus` | publish / receive / ack events | `SqsEventBus` (boto3) | `PubSubEventBus` (google-cloud-pubsub) |
+| `SecretStore` | read a secret value by name | `SecretsManagerStore` | `SecretManagerStore` |
+
+The adapter is picked at runtime from `CLOUD_PROVIDER`. New clouds add
+a new module (`shared/cloud/azure.py`) and a new branch in
+`shared/cloud/__init__.py`'s `event_bus()` / `secret_store()`
+factories. Adapter imports are lazy, so containers don't need SDKs
+they won't use.
+
+That's the whole code-side contract. Everything else is infrastructure
+plumbing.
+
+## Resource mapping
+
+| Concern | AWS | GCP | Azure (suggested) |
+|---|---|---|---|
+| Compute | ECS Fargate behind ALB | Cloud Run v2 | Container Apps |
+| Container registry | ECR | Artifact Registry | Azure Container Registry |
+| Database | RDS Postgres | Cloud SQL Postgres (via Auth Proxy) | Azure DB for Postgres Flexible Server |
+| Event bus | SQS + DLQ + redrive | Pub/Sub topic + sub + DLT | Service Bus queue + dead-letter |
+| App secrets (JWT, INTERNAL_TOKEN) | Secrets Manager + ECS task `secrets` block | Secret Manager + Cloud Run `value_source.secret_key_ref` | Key Vault + Container Apps secret refs |
+| Tuya credentials | Secrets Manager, scoped task role | Secret Manager, scoped `secretAccessor` | Key Vault, scoped Key Vault Secrets User role |
+| Service identity | One ECS task role + scoped tuya-bridge role | One `google_service_account` per service | One user-assigned managed identity per service |
+| Inbound auth | API Gateway in front of ALB | Direct invocation; `allUsers` invoker | Container Apps ingress; `external` ingress per service |
+| Cross-service routing | Path-based via shared ALB | Per-service `*.run.app` URLs | Per-service `*.azurecontainerapps.io` URLs |
+
+## Porting workflow
+
+1. **Scaffold `azure/`** as a verbatim copy of `gcp/` (mirror what PR #7
+   did). Drop a banner in `azure/README.md` that says "not functional
+   yet" until terraform actually works.
+
+2. **Register the resource providers** the subscription will use:
+   `Microsoft.App` (Container Apps), `Microsoft.ContainerRegistry`,
+   `Microsoft.ServiceBus`, `Microsoft.KeyVault`,
+   `Microsoft.DBforPostgreSQL`. Either via `az provider register
+   --namespace <ns>` once per subscription, or via
+   `azurerm_resource_provider_registration` resources in terraform so
+   apply is self-bootstrapping (analogous to where the GCP port
+   should've used `google_project_service` but didn't — same TODO).
+
+3. **Replace `gcp/terraform/`** with Azure-provider modules:
+   - `modules/container-apps/` (compute) — mirrors `gcp/terraform/modules/cloud-run/`
+   - `modules/database/` — `azurerm_postgresql_flexible_server`
+   - `modules/registry/` — `azurerm_container_registry` + build/push provisioner
+   - Add `azurerm_servicebus_namespace` + queue + DLQ to `main.tf`
+   - Add `azurerm_key_vault` + secrets in `main.tf`, scoped via role assignments
+   - **Don't** copy the IAM bindings naïvely — re-derive per-service identities
+
+4. **Write `shared/cloud/azure.py`** implementing `EventBus` and
+   `SecretStore` against `azure-servicebus` and `azure-keyvault-secrets`.
+   Add an `elif provider == "azure":` branch in
+   `shared/cloud/__init__.py`.
+
+5. **Update Dockerfiles** for each service in `azure/services/` to swap
+   the Python deps (`boto3` or `google-cloud-*` → `azure-servicebus` +
+   `azure-keyvault-secrets` + `azure-identity`).
+
+6. **Port the ops scripts** (`push_images.sh`, `redeploy.sh`,
+   `set_tuya_secrets.sh`, `test_apis.sh`) — same shape as the GCP
+   versions, swap `gcloud` for `az`. `test_apis.sh`'s per-service URL
+   dispatch logic (and its **bash 4+** requirement — the bash-version
+   check at the top of the script) carries over unchanged; just read
+   from `terraform output -json service_urls`.
+
+7. **Real apply** on an Azure subscription. Iterate on whatever breaks.
+
+## Gotchas the GCP port hit (and Azure probably will too)
+
+- **Database connectivity is meaningfully different.** GCP uses the
+  Cloud SQL Auth Proxy mounted as a unix socket — `DATABASE_URL` looks
+  like `postgresql+asyncpg://user:pass@/db?host=/cloudsql/<conn>`.
+  Azure has no equivalent; pick between (a) Container Apps environment
+  with VNet integration + Private Endpoint on Postgres, or (b)
+  Postgres with public access + a firewall rule for the Container
+  Apps egress IPs. Either way `DATABASE_URL` becomes a regular TCP
+  URL: `postgresql+asyncpg://user:pass@<host>:5432/db?ssl=require`.
+  This is one of the few places where the Azure adapter has to change
+  something service-code-visible (the env var format), so wire it
+  through `azure/terraform/modules/container-apps/main.tf`'s
+  `DATABASE_URL` construction carefully.
+
+- **Cycle: `device-service` ↔ `tuya-bridge` URIs.** Both services need
+  each other's URL at startup; if both are in one `for_each` and both
+  declare `<other>.url` in their env, terraform errors with "cycle."
+  GCP's answer: pull `tuya-bridge` into a separate resource, set
+  `device-service`'s URL via Terraform reference, patch the other
+  direction in via a `null_resource` running `az containerapp update`
+  after both exist, and `lifecycle.ignore_changes = [...env]` on
+  `tuya-bridge` so the patch isn't seen as drift. See
+  `gcp/terraform/modules/cloud-run/main.tf` and `gcp/README.md`'s
+  "Cross-service URLs" section for the full pattern. Apply the same
+  shape to Container Apps.
+
+- **Secret IAM race.** First `terraform apply` can deadlock if the
+  Container App tries to start before its identity has been granted
+  read access on the Key Vault secret. Mitigate by putting the role
+  assignments **inside the compute module** and adding
+  `depends_on = [<role assignments>]` on the Container App resources
+  themselves — see `gcp/terraform/modules/cloud-run/main.tf`'s
+  `app_secrets` + `depends_on` for the analogue.
+
+- **Secrets are loaded at container start, not per-request.** Updating
+  a Key Vault secret won't recycle live container revisions; you have
+  to force new revisions. The GCP rotation runbook in `gcp/README.md`
+  is the template — adapt the `gcloud` commands to `az`.
+
+- **Build context = repo root.** Service Dockerfiles need to `COPY
+  shared/` into the image, so every `docker build` must run from the
+  repo root with `-f azure/services/<svc>/Dockerfile`. Otherwise
+  `from shared.cloud import event_bus` fails at startup. The
+  registry module's null_resource is the source of truth for this
+  pattern — copy `gcp/terraform/modules/registry/main.tf`'s shape.
+
+- **Source hash must include `shared/`.** When the abstraction layer
+  changes, every service image needs rebuilding. The `src_hash`
+  trigger on the build null_resource should fold in
+  `fileset("${path.root}/../../shared", "**/*.py")` the way both
+  cloud-specific modules already do.
+
+- **Container Apps min-replicas costs real money** the same way Cloud
+  Run does. Default `min_instances = 0` for demos; bump to 2 only
+  when actively showing the load-balancer behavior.
+
+## Verifying the port
+
+Once Azure is provisioned, the same `test_apis.sh` should pass
+against the new per-service URLs. If it does, the port is done
+end-to-end. If a specific service fails, it's almost always one of:
+
+- adapter wired wrong (`CLOUD_PROVIDER` env var, or the protocol
+  contract slipped)
+- IAM grant missing on the runtime identity
+- secret name mismatch between terraform and the service's env
+
+The shape of the AWS and GCP deployments is identical from the
+service's perspective — Azure should land in the same place.
