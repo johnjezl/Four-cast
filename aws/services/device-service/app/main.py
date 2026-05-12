@@ -18,7 +18,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import boto3
 import httpx
@@ -105,13 +105,151 @@ class DeviceStateUpdate(BaseModel):
 
 
 class CommandRequest(BaseModel):
-    command: str
+    capability: str
     value: Any
 
 
 class ReportedStateUpdate(BaseModel):
     tuya_device_id: str
     reported: dict
+
+
+# =============================================================================
+# Canonical capability vocabulary
+# =============================================================================
+# The platform API speaks these names only. Vendor-specific translation
+# (Tuya datapoint codes, value-range scaling, etc.) lives in each adapter.
+# Adding a new capability here is the only place a new device feature
+# needs to be defined at the platform layer.
+
+CAPABILITIES = {
+    "power": {
+        "type": "bool",
+        "description": "On/off state",
+    },
+    "brightness": {
+        "type": "int",
+        "range": [0, 100],
+        "unit": "percent",
+        # Note: brightness 0 is clamped to ~1% on most hardware (Tuya
+        # minimum is 10/1000). Use `power: false` to actually turn off.
+        "description": "Brightness as a percentage of device maximum",
+    },
+    "color": {
+        "type": "object",
+        "schema": {
+            "h": {"range": [0, 360], "unit": "degrees"},
+            "s": {"range": [0, 100], "unit": "percent"},
+            "v": {"range": [0, 100], "unit": "percent"},
+        },
+        "description": "Color as HSV with normalized 0-100 saturation/value",
+    },
+    "color_temp": {
+        "type": "int",
+        "range": [0, 100],
+        "unit": "percent",
+        "description": "Color temperature, 0 = warmest, 100 = coolest",
+    },
+    "mode": {
+        "type": "string",
+        "enum": ["white", "colour", "scene", "music"],
+        "description": "Bulb operating mode",
+    },
+}
+
+# Keys allowed in `reported` state that aren't capabilities — metadata
+# the bridge sets to help operators reason about freshness.
+_REPORTED_METADATA_KEYS = {"last_sync"}
+
+
+def _validate_value(capability: str, value) -> None:
+    spec = CAPABILITIES.get(capability)
+    if not spec:
+        return  # name already gated by validate_state_keys
+    t = spec.get("type")
+    if t == "bool":
+        if not isinstance(value, bool):
+            raise HTTPException(status_code=400,
+                                detail=f"{capability} must be a bool")
+    elif t == "int":
+        # bool is a subclass of int in Python; explicitly disallow.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise HTTPException(status_code=400,
+                                detail=f"{capability} must be an int")
+        rng = spec.get("range")
+        if rng and not (rng[0] <= value <= rng[1]):
+            raise HTTPException(status_code=400,
+                                detail=f"{capability} must be in {rng}, got {value}")
+    elif t == "string":
+        if not isinstance(value, str):
+            raise HTTPException(status_code=400,
+                                detail=f"{capability} must be a string")
+        enum = spec.get("enum")
+        if enum and value not in enum:
+            raise HTTPException(status_code=400,
+                                detail=f"{capability} must be one of {enum}")
+    elif t == "object":
+        if not isinstance(value, dict):
+            raise HTTPException(status_code=400,
+                                detail=f"{capability} must be an object")
+        schema = spec.get("schema") or {}
+        unknown_subs = [k for k in value.keys() if k not in schema]
+        if unknown_subs:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{capability} has unknown sub-keys: {unknown_subs}. "
+                       f"Allowed: {sorted(schema.keys())}",
+            )
+        for sub_key, sub_spec in schema.items():
+            sub_val = value.get(sub_key)
+            if sub_val is None:
+                continue  # absent sub-keys are OK — see _deep_merge_capabilities
+            if isinstance(sub_val, bool) or not isinstance(sub_val, int):
+                raise HTTPException(status_code=400,
+                                    detail=f"{capability}.{sub_key} must be an int")
+            sub_rng = sub_spec.get("range")
+            if sub_rng and not (sub_rng[0] <= sub_val <= sub_rng[1]):
+                raise HTTPException(status_code=400,
+                                    detail=f"{capability}.{sub_key} must be in {sub_rng}, got {sub_val}")
+
+
+def _deep_merge_capabilities(existing: dict, update: dict) -> dict:
+    """Merge `update` into `existing`. For keys whose capability spec is
+    `type: object`, merge sub-keys (so `{"color": {"h": 200}}` doesn't
+    blow away the existing `s` and `v`). Everything else is shallow-
+    replaced, matching the historical semantics of the API."""
+    result = dict(existing)
+    for key, value in update.items():
+        spec = CAPABILITIES.get(key)
+        is_object_merge = (
+            spec is not None
+            and spec.get("type") == "object"
+            and isinstance(value, dict)
+            and isinstance(result.get(key), dict)
+        )
+        if is_object_merge:
+            result[key] = {**result[key], **value}
+        else:
+            result[key] = value
+    return result
+
+
+def validate_state_keys(state: dict, device_type: DeviceType) -> None:
+    """Reject any state that doesn't match the device type's capabilities.
+    Keys must be in the type's capability list; values must match the
+    type / range / enum declared in CAPABILITIES. Catches typos, leftover
+    vendor codes, and malformed input at the API edge instead of letting
+    them propagate into the shadow."""
+    allowed = set(device_type.capabilities)
+    bad = [k for k in state.keys() if k not in allowed]
+    if bad:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown capabilities for {device_type.id}: {bad}. "
+                   f"Allowed: {sorted(allowed)}",
+        )
+    for k, v in state.items():
+        _validate_value(k, v)
 
 
 # =============================================================================
@@ -123,20 +261,20 @@ device_types_db: dict[str, DeviceType] = {
         id="tuya-smart-bulb",
         name="Tuya Smart Bulb",
         manufacturer="MAXvolador",
-        capabilities=["switch", "brightness", "color", "color_temp"],
+        capabilities=["power", "brightness", "color", "color_temp", "mode"],
         default_state={
-            "switch_led": False,
-            "bright_value_v2": 500,
-            "colour_data_v2": {"h": 0, "s": 0, "v": 1000},
-            "work_mode": "white",
+            "power": False,
+            "brightness": 50,
+            "color": {"h": 0, "s": 0, "v": 100},
+            "mode": "white",
         },
     ),
     "tuya-smart-plug": DeviceType(
         id="tuya-smart-plug",
         name="Tuya Smart Plug",
         manufacturer="Generic",
-        capabilities=["switch", "energy_monitoring"],
-        default_state={"switch": False, "cur_power": 0, "cur_voltage": 0},
+        capabilities=["power"],
+        default_state={"power": False},
     ),
 }
 
@@ -186,15 +324,21 @@ def _merged_view(env: dict) -> dict:
 async def _save_envelope(
     session: AsyncSession,
     device_id: str,
-    mutate,
+    mutate: Callable[[dict], dict],
     max_retries: int = 3,
+    validate: Optional[Callable[["Device"], None]] = None,
 ) -> tuple["Device", dict]:
     """Apply `mutate(env) -> new_env` to a device's shadow envelope with
     optimistic concurrency. Re-reads on version conflict; raises 409 after
     `max_retries` consecutive conflicts. Returns the (device, new_env)
     pair — callers should use the returned Device rather than re-fetching,
     since the bulk UPDATE bypasses the ORM identity map and a follow-up
-    session.get() may return stale state."""
+    session.get() may return stale state.
+
+    `validate(device)` (optional) is invoked on the first read each
+    iteration, before the mutate runs. Use it for input validation that
+    needs device context (e.g., capability checks). Idempotent across
+    retries — device.device_type_id doesn't change."""
     for _ in range(max_retries):
         stmt = (
             select(Device)
@@ -204,6 +348,9 @@ async def _save_envelope(
         device = (await session.execute(stmt)).scalar_one_or_none()
         if not device:
             raise HTTPException(status_code=404, detail="Device not found")
+
+        if validate is not None:
+            validate(device)
 
         env = _envelope(device.state)
         expected_version = env["version"]
@@ -294,10 +441,24 @@ def require_internal_token(x_internal_token: Optional[str] = Header(None)):
 # Application
 # =============================================================================
 
+def _sanity_check_device_types() -> None:
+    """Fail fast if a DeviceType declares a capability that isn't in
+    CAPABILITIES — catches typos in seed data instead of letting them
+    surface as a 400 on first user request."""
+    for type_id, dt in device_types_db.items():
+        bad = [c for c in dt.capabilities if c not in CAPABILITIES]
+        if bad:
+            raise RuntimeError(
+                f"DeviceType {type_id} declares unknown capabilities: {bad}. "
+                f"Add to CAPABILITIES or remove from the type definition."
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient()
+    _sanity_check_device_types()
     logger.info("Device Service starting...")
     await init_db()
     try:
@@ -355,6 +516,14 @@ async def service_info(session: AsyncSession = Depends(get_session)):
 # =============================================================================
 # Device Type Endpoints
 # =============================================================================
+
+@app.get("/api/v1/device/capabilities", tags=["Device Types"])
+async def list_capabilities():
+    """The canonical capability vocabulary supported by the platform.
+    Clients (and device firmware) should consult this rather than
+    hardcoding capability names."""
+    return {"capabilities": CAPABILITIES}
+
 
 @app.get("/api/v1/device/types", tags=["Device Types"])
 async def list_device_types():
@@ -478,10 +647,11 @@ async def get_device_state(device_id: str, session: AsyncSession = Depends(get_s
 
 def _apply_desired(state_update: dict):
     """Mutate factory: merge state_update into desired and reset retry
-    tracking (new command supersedes any prior pending state)."""
+    tracking (new command supersedes any prior pending state). Object
+    capabilities deep-merge — partial writes preserve untouched sub-keys."""
     def mutate(env: dict) -> dict:
         return {
-            "desired": {**env["desired"], **state_update},
+            "desired": _deep_merge_capabilities(env["desired"], state_update),
             "reported": env["reported"],
             "version": env["version"],
             "retry_count": 0,
@@ -496,7 +666,14 @@ async def update_device_state(
     update: DeviceStateUpdate,
     session: AsyncSession = Depends(get_session),
 ):
-    device, new_env = await _save_envelope(session, device_id, _apply_desired(update.state))
+    def _validate(dev: Device) -> None:
+        device_type = device_types_db.get(dev.device_type_id)
+        if device_type:
+            validate_state_keys(update.state, device_type)
+
+    device, new_env = await _save_envelope(
+        session, device_id, _apply_desired(update.state), validate=_validate
+    )
 
     # Optimistic online flag — caller just touched this device, so we know
     # it's alive from the platform's perspective even before the bridge
@@ -522,8 +699,16 @@ async def send_device_command(
     command: CommandRequest,
     session: AsyncSession = Depends(get_session),
 ):
-    state_update = {command.command: command.value}
-    device, _new_env = await _save_envelope(session, device_id, _apply_desired(state_update))
+    state_update = {command.capability: command.value}
+
+    def _validate(dev: Device) -> None:
+        device_type = device_types_db.get(dev.device_type_id)
+        if device_type:
+            validate_state_keys(state_update, device_type)
+
+    device, _new_env = await _save_envelope(
+        session, device_id, _apply_desired(state_update), validate=_validate
+    )
 
     if not device.online:
         device.online = True
@@ -535,39 +720,39 @@ async def send_device_command(
         await dispatch_command(device.tuya_device_id, state_update)
 
     await publish_device_event("device.command", device, {
-        "command": command.command,
+        "capability": command.capability,
         "value": command.value,
     })
 
     return {
         "device_id": device_id,
-        "command": command.command,
+        "capability": command.capability,
         "value": command.value,
         "success": True,
     }
 
 
 # =============================================================================
-# Convenience endpoints
+# Convenience endpoints — write canonical capability names
 # =============================================================================
 
 @app.post("/api/v1/device/devices/{device_id}/on", tags=["Quick Controls"])
 async def turn_device_on(device_id: str, session: AsyncSession = Depends(get_session)):
-    return await send_device_command(device_id, CommandRequest(command="switch_led", value=True), session)
+    return await send_device_command(device_id, CommandRequest(capability="power", value=True), session)
 
 
 @app.post("/api/v1/device/devices/{device_id}/off", tags=["Quick Controls"])
 async def turn_device_off(device_id: str, session: AsyncSession = Depends(get_session)):
-    return await send_device_command(device_id, CommandRequest(command="switch_led", value=False), session)
+    return await send_device_command(device_id, CommandRequest(capability="power", value=False), session)
 
 
 @app.post("/api/v1/device/devices/{device_id}/brightness", tags=["Quick Controls"])
 async def set_brightness(
     device_id: str,
-    level: int = Query(..., ge=10, le=1000),
+    level: int = Query(..., ge=0, le=100, description="Brightness percent, 0-100"),
     session: AsyncSession = Depends(get_session),
 ):
-    return await send_device_command(device_id, CommandRequest(command="bright_value_v2", value=level), session)
+    return await send_device_command(device_id, CommandRequest(capability="brightness", value=level), session)
 
 
 # =============================================================================
@@ -588,11 +773,32 @@ async def receive_reported_state(
     if not device:
         return {"status": "unknown_device"}
 
+    # Internal endpoints don't run the public validate_state_keys path —
+    # bridges are trusted to translate vendor data into canonical form
+    # before posting. We do still filter the merged reported by the
+    # device type's capability list (plus metadata keys) on the way in:
+    # cheap defense against a buggy adapter, and the one-shot cleanup
+    # that strips Tuya-coded keys from legacy rows written before the
+    # vocabulary abstraction landed.
+    #
+    # Capability coverage is constrained by the *intersection* of
+    # bridge translation and seed-data declaration: if a bridge knows
+    # how to emit a canonical key that's not in the device type's
+    # capabilities list, the platform silently drops it. Keep
+    # CAPABILITIES, the bridge translator (canonical_to_tuya /
+    # tuya_status_to_canonical), and DeviceType.capabilities in sync
+    # when adding features.
+    device_type = device_types_db.get(device.device_type_id)
+    allowed_reported = (set(device_type.capabilities) | _REPORTED_METADATA_KEYS
+                        if device_type else None)
+
     def mutate(env: dict) -> dict:
-        # Merge incoming reported into existing reported first, then drop
-        # desired keys whose new reported value matches — comparison must
-        # use the *merged* view, not the pre-merge env.
-        new_reported = {**env["reported"], **payload.reported}
+        # Deep-merge so partial reported updates (e.g. `{"color": {"h":
+        # 200}}` from the bridge's optimistic post) don't wipe sub-keys.
+        new_reported = _deep_merge_capabilities(env["reported"], payload.reported)
+        if allowed_reported is not None:
+            new_reported = {k: v for k, v in new_reported.items()
+                            if k in allowed_reported}
         new_desired = {
             k: v for k, v in env["desired"].items()
             if new_reported.get(k) != v

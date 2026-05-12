@@ -97,6 +97,30 @@ Devices, device templates, and state control. State changes propagate to the phy
 
 ### Device state
 
+The platform speaks a canonical capability vocabulary. Vendor-specific datapoint codes (`switch_led`, `bright_value_v2`, etc.) only exist inside the appropriate adapter — `device-service` and your code should use the capability names below.
+
+> **Breaking change (v3)**: the API previously accepted Tuya datapoint codes directly (`switch_led`, `bright_value_v2`, `colour_data_v2`), and `/brightness?level=` took 10–1000. Both now expect canonical names and 0–100 ranges. Any client outside `test_apis.sh` that issued raw Tuya codes needs updating.
+
+| Capability | Type | Range | Description |
+|---|---|---|---|
+| `power` | bool | — | On/off |
+| `brightness` | int | 0–100 | Percent of device maximum. **Note:** `0` clamps to ~1% on most hardware (vendor minimum). Use `power: false` to actually turn off. |
+| `color` | object | `{ h: 0–360, s: 0–100, v: 0–100 }` | HSV |
+| `color_temp` | int | 0–100 | 0 = warmest, 100 = coolest |
+| `mode` | string | `white \| colour \| scene \| music` | Bulb operating mode |
+
+Validation at the API edge:
+
+- State keys not declared on the device type's `capabilities` are rejected with 400.
+- Values are type-checked and range-checked against this table.
+- For object capabilities (`color`), unknown sub-keys (e.g. `color.alpha`) are also rejected with 400.
+
+Fetch the machine-readable version at:
+
+```
+GET /api/v1/device/capabilities
+```
+
 | Method | Path | Description |
 |---|---|---|
 | GET | `/api/v1/device/devices/{id}/state` | Current state (merged view of reported + desired) |
@@ -104,15 +128,17 @@ Devices, device templates, and state control. State changes propagate to the phy
 
 **State body:**
 ```json
-{ "state": { "switch_led": true, "bright_value_v2": 800 } }
+{ "state": { "power": true, "brightness": 80 } }
 ```
+
+**Merge semantics on PUT.** Top-level keys shallow-replace: writing `{"state": {"power": false}}` leaves `brightness` untouched. Object capabilities (today just `color`) **deep-merge** their sub-keys — `{"state": {"color": {"h": 200}}}` changes the hue while preserving the existing `s` and `v`. Send all sub-keys explicitly if you want to replace the whole object.
 
 **GET response shape:**
 ```json
 {
-  "state":    { "switch_led": true, "bright_value_v2": 800 },
-  "desired":  { "switch_led": true },
-  "reported": { "bright_value_v2": 800, "last_sync": 1715472000 },
+  "state":    { "power": true, "brightness": 80 },
+  "desired":  { "power": true },
+  "reported": { "brightness": 80, "last_sync": 1715472000 },
   "version":  42,
   "source":   "postgres"
 }
@@ -122,18 +148,16 @@ Devices, device templates, and state control. State changes propagate to the phy
 
 ### Convenience controls
 
-Convenience endpoints that wrap state updates with the right command codes:
-
 | Method | Path | Description |
 |---|---|---|
-| POST | `/api/v1/device/devices/{id}/on` | Turn on |
-| POST | `/api/v1/device/devices/{id}/off` | Turn off |
-| POST | `/api/v1/device/devices/{id}/brightness?level=N` | Set brightness (`N` between 10 and 1000) |
-| POST | `/api/v1/device/devices/{id}/command` | Send a raw command |
+| POST | `/api/v1/device/devices/{id}/on` | Set `power: true` |
+| POST | `/api/v1/device/devices/{id}/off` | Set `power: false` |
+| POST | `/api/v1/device/devices/{id}/brightness?level=N` | Set `brightness: N` (`N` between 0 and 100) |
+| POST | `/api/v1/device/devices/{id}/command` | Send a single-capability command |
 
-**Raw command body:**
+**Command body:**
 ```json
-{ "command": "colour_data_v2", "value": { "h": 120, "s": 255, "v": 1000 } }
+{ "capability": "color", "value": { "h": 120, "s": 80, "v": 100 } }
 ```
 
 ---
@@ -171,7 +195,7 @@ Seeded templates: `sunset-lights`, `motion-lights`, `away-mode`, `energy-saver`.
   "trigger_type": "schedule",
   "trigger_config": { "time": "20:00" },
   "actions": [
-    { "type": "set_state", "target": "all_lights", "state": { "bright_value_v2": 300 } }
+    { "type": "set_state", "target": "all_lights", "state": { "brightness": 30 } }
   ]
 }
 ```

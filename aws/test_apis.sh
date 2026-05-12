@@ -95,6 +95,7 @@ parse_flags() {
       --tuya-id)      TUYA_ID="$2";      shift 2 ;;
       --state)        STATE="$2";        shift 2 ;;
       --level)        LEVEL="$2";        shift 2 ;;
+      --capability)   COMMAND="$2";      shift 2 ;;
       --command)      COMMAND="$2";      shift 2 ;;
       --value)        VALUE="$2";        shift 2 ;;
       --email)        EMAIL="$2";        shift 2 ;;
@@ -163,8 +164,8 @@ op_device_brightness() {
 op_device_command() {
   need ID; need COMMAND; need VALUE
   local body
-  body=$(jq -nc --arg c "$COMMAND" --argjson v "$VALUE" '{command:$c, value:$v}' 2>/dev/null \
-         || jq -nc --arg c "$COMMAND" --arg v "$VALUE" '{command:$c, value:$v}')
+  body=$(jq -nc --arg c "$COMMAND" --argjson v "$VALUE" '{capability:$c, value:$v}' 2>/dev/null \
+         || jq -nc --arg c "$COMMAND" --arg v "$VALUE" '{capability:$c, value:$v}')
   call POST "/api/v1/device/devices/$ID/command" 200 "$body"
 }
 
@@ -301,11 +302,11 @@ DEVICE-SERVICE
   device-get                    --id DEVICE_ID
   device-delete                 --id DEVICE_ID
   device-state-get              --id DEVICE_ID
-  device-state-set              --id DEVICE_ID --state '{"switch_led":true}'
+  device-state-set              --id DEVICE_ID --state '{"power":true,"brightness":80}'
   device-on                     --id DEVICE_ID
   device-off                    --id DEVICE_ID
-  device-brightness             --id DEVICE_ID --level 10..1000
-  device-command                --id DEVICE_ID --command CODE --value V (JSON literal)
+  device-brightness             --id DEVICE_ID --level 0..100  (percent)
+  device-command                --id DEVICE_ID --capability CAP --value V (JSON literal)
 
 AUTOMATION-SERVICE
   template-list                 [--category C]
@@ -380,11 +381,11 @@ run_all() {
   if [ -n "$did" ]; then
     call GET    "/api/v1/device/devices/$did"
     call GET    "/api/v1/device/devices/$did/state"
-    call PUT    "/api/v1/device/devices/$did/state" 200 '{"state":{"switch_led":true}}'
+    call PUT    "/api/v1/device/devices/$did/state" 200 '{"state":{"power":true,"brightness":80}}'
     call POST   "/api/v1/device/devices/$did/on"
     call POST   "/api/v1/device/devices/$did/off"
-    call POST   "/api/v1/device/devices/$did/brightness?level=500"
-    call POST   "/api/v1/device/devices/$did/command" 200 '{"command":"work_mode","value":"colour"}'
+    call POST   "/api/v1/device/devices/$did/brightness?level=50"
+    call POST   "/api/v1/device/devices/$did/command" 200 '{"capability":"mode","value":"colour"}'
     call DELETE "/api/v1/device/devices/$did"
   fi
 
@@ -439,7 +440,7 @@ run_all() {
   call GET /api/v1/analytics/maturity
   call GET /api/v1/analytics/devices/summary
   call GET /api/v1/analytics/usage
-  call GET "/api/v1/analytics/devices/test-device-id/metrics?metric=brightness&hours=24"
+  call GET "/api/v1/analytics/devices/test-device-id/metrics?event_type=device.state_changed&hours=24"
 
   local total=$((PASS+FAIL))
   printf "\n%s%s%s\n" "$DIM" "============================================================" "$RST"

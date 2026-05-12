@@ -231,26 +231,102 @@ _CATEGORY_TO_TYPE = {
     "pc": "tuya-smart-plug",
 }
 
-_COMMAND_MAPPING = {
-    "switch_led": "switch_led",
-    "power": "switch_led",
-    "bright_value_v2": "bright_value_v2",
-    "brightness": "bright_value_v2",
-    "colour_data_v2": "colour_data_v2",
-    "color": "colour_data_v2",
-    "temp_value_v2": "temp_value_v2",
-    "work_mode": "work_mode",
-}
-
-
 def infer_device_type(tuya_category: str) -> str:
     return _CATEGORY_TO_TYPE.get((tuya_category or "").lower(), "tuya-smart-bulb")
 
 
-def tuya_status_to_reported(status: list) -> dict:
-    reported = {item.get("code"): item.get("value") for item in status if item.get("code")}
-    reported["last_sync"] = int(time.time())
-    return reported
+# =============================================================================
+# Canonical ↔ Tuya translation
+# =============================================================================
+# The bridge is the ONLY place vendor-specific datapoint codes or value
+# ranges exist. Device-service stores canonical capabilities; this module
+# translates in both directions.
+#
+# Canonical capability   Tuya datapoint     Value scaling
+# ────────────────────   ───────────────    ────────────────────────────
+# power: bool            switch_led: bool   identity
+# brightness: 0-100      bright_value_v2:   x10 (canonical 0 floored to 10)
+#                        10-1000
+# color: {h,s,v}         colour_data_v2:    s and v ×10 (h unchanged)
+#   s,v 0-100              s,v 0-1000
+# color_temp: 0-100      temp_value_v2:     x10
+#                        0-1000
+# mode: str              work_mode: str     identity
+
+_TUYA_BRIGHTNESS_MIN = 10
+_TUYA_BRIGHTNESS_MAX = 1000
+
+
+def _scale_canonical_to_tuya_pct(value: int, floor: int = 0) -> int:
+    """Map canonical 0-100 percent → Tuya 0-1000 scale, clamped to a floor."""
+    return max(floor, min(_TUYA_BRIGHTNESS_MAX, int(round(value * 10))))
+
+
+def _scale_tuya_to_canonical_pct(value: int) -> int:
+    """Map Tuya 0-1000 → canonical 0-100, clamped."""
+    return max(0, min(100, int(round(value / 10))))
+
+
+def canonical_to_tuya(desired: dict) -> list[dict]:
+    """Translate a canonical desired-state dict into a list of Tuya
+    command dicts ({code, value}). Unknown capabilities are dropped with
+    a warning rather than passed through — keeps a typo from silently
+    reaching the cloud."""
+    commands = []
+    for capability, value in desired.items():
+        if capability == "power":
+            commands.append({"code": "switch_led", "value": bool(value)})
+        elif capability == "brightness":
+            commands.append({"code": "bright_value_v2",
+                             "value": _scale_canonical_to_tuya_pct(value, floor=_TUYA_BRIGHTNESS_MIN)})
+        elif capability == "color" and isinstance(value, dict):
+            commands.append({"code": "colour_data_v2", "value": {
+                "h": int(value.get("h", 0)),
+                "s": _scale_canonical_to_tuya_pct(value.get("s", 0)),
+                "v": _scale_canonical_to_tuya_pct(value.get("v", 100), floor=_TUYA_BRIGHTNESS_MIN),
+            }})
+        elif capability == "color_temp":
+            commands.append({"code": "temp_value_v2", "value": _scale_canonical_to_tuya_pct(value)})
+        elif capability == "mode":
+            commands.append({"code": "work_mode", "value": value})
+        else:
+            # device-service's validate_state_keys should have rejected
+            # this before the bridge ever saw it. If we land here, either
+            # the bridge and device-service drifted out of sync on
+            # vocabulary, or a buggy adapter wrote directly. Error-level
+            # so it's visible without a debug dive.
+            logger.error(
+                f"Bridge received unknown capability '{capability}' from "
+                f"device-service. This should be caught at the API edge. "
+                f"Dropping."
+            )
+    return commands
+
+
+def tuya_status_to_canonical(status: list) -> dict:
+    """Translate a Tuya status array (list of {code, value}) back into a
+    canonical reported-state dict. Tuya codes we don't recognize are
+    dropped — they're vendor noise from the platform's perspective."""
+    canonical: dict = {}
+    for item in status:
+        code = item.get("code")
+        value = item.get("value")
+        if code == "switch_led":
+            canonical["power"] = bool(value)
+        elif code == "bright_value_v2":
+            canonical["brightness"] = _scale_tuya_to_canonical_pct(int(value))
+        elif code == "colour_data_v2" and isinstance(value, dict):
+            canonical["color"] = {
+                "h": int(value.get("h", 0)),
+                "s": _scale_tuya_to_canonical_pct(int(value.get("s", 0))),
+                "v": _scale_tuya_to_canonical_pct(int(value.get("v", 0))),
+            }
+        elif code == "temp_value_v2":
+            canonical["color_temp"] = _scale_tuya_to_canonical_pct(int(value))
+        elif code == "work_mode":
+            canonical["mode"] = value
+    canonical["last_sync"] = int(time.time())
+    return canonical
 
 
 # =============================================================================
@@ -342,18 +418,12 @@ async def fetch_pending() -> list:
 # Command + poll logic
 # =============================================================================
 
-def desired_to_commands(desired: dict) -> list:
-    commands = []
-    for key, value in desired.items():
-        code = _COMMAND_MAPPING.get(key, key)
-        commands.append({"code": code, "value": value})
-    return commands
-
-
 async def send_command(tuya_device_id: str, desired: dict) -> dict:
-    """Send commands to Tuya, then optimistically report mapped codes back
-    to device-service so the delta clears immediately."""
-    commands = desired_to_commands(desired)
+    """Translate canonical desired state to Tuya commands, send them, then
+    optimistically mirror the canonical desired into device-service's
+    reported state so the delta clears immediately. The next poll tick
+    overwrites reported with Tuya's authoritative state."""
+    commands = canonical_to_tuya(desired)
     if not commands:
         return {"status": "noop"}
 
@@ -362,8 +432,9 @@ async def send_command(tuya_device_id: str, desired: dict) -> dict:
     logger.info(f"Sent commands to {tuya_device_id}: {commands} -> {result}")
 
     if result.get("success"):
-        reported = {cmd["code"]: cmd["value"] for cmd in commands}
-        await post_reported(tuya_device_id, reported)
+        # Report back using the canonical names the user wrote, not the
+        # Tuya codes — device-service stores canonical only.
+        await post_reported(tuya_device_id, dict(desired))
         return {"status": "ok", "result": result}
     return {"status": "tuya_error", "result": result}
 
@@ -395,7 +466,7 @@ async def poll_once() -> dict:
         try:
             status = await asyncio.to_thread(tuya.get_device_status, device_id)
             if status:
-                reported = tuya_status_to_reported(status)
+                reported = tuya_status_to_canonical(status)
                 await post_reported(device_id, reported)
                 results.append({"device_id": device_id, "status": "ok"})
             else:
