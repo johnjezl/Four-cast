@@ -21,18 +21,53 @@ No VPC / networking module — Cloud Run is fully managed and reaches
 Cloud SQL through the Auth Proxy's unix socket, so a Serverless VPC
 Connector isn't needed for this topology.
 
+## Cross-service URLs — how the cycle is broken
+
+`device-service` ↔ `tuya-bridge` need each other's `*.run.app` URI,
+which would form a Terraform reference cycle if both were declared
+inside the same `for_each`. The module breaks it by:
+
+1. Pulling `tuya-bridge` out of the `for_each` into its own
+   `google_cloud_run_v2_service` resource. `device-service` references
+   that resource's `.uri` at create time (`TUYA_BRIDGE_URL` env var).
+2. Patching `DEVICE_SERVICE_URL` onto `tuya-bridge` *after* both
+   services exist via a `null_resource` that runs
+   `gcloud run services update --update-env-vars`.
+3. Setting `lifecycle.ignore_changes = [...env]` on the `tuya-bridge`
+   resource so the post-create patch isn't seen as drift on subsequent
+   plans.
+
+**Trade-off:** `tuya-bridge`'s env list is effectively "managed by
+null_resource" going forward. Terraform-declared changes to its env
+(e.g. rotating `JWT_SECRET` via `terraform taint
+random_password.jwt_secret`) won't auto-apply — they need
+`terraform taint null_resource.patch_tuya_bridge_url` to re-trigger
+the patch, or a manual `gcloud run services update`. The other four
+services have normal Terraform env management.
+
+Image rebuilds and other Terraform-managed updates to `tuya-bridge`
+*are* handled: `replace_triggered_by` on the null_resource re-runs
+the patch whenever Terraform updates `tuya-bridge` for any reason,
+so `DEVICE_SERVICE_URL` survives image bumps and resource-limit
+changes. Manual `gcloud run services update --image=...` outside of
+Terraform bypasses this — pass `--update-env-vars=DEVICE_SERVICE_URL=...`
+explicitly when doing that, or follow with a `terraform apply` to
+re-run the patch.
+
+`tuya-bridge` is also reachable via `allUsers` invoker (same as the
+other services). PR #9's IAM restriction to the `device-service` SA
+was reverted in this PR — invoking it from `device-service` over
+Cloud Run IAM would require minting Google ID tokens, which is a
+service-code change we deferred. App-level `INTERNAL_TOKEN` remains
+the real auth boundary, matching the AWS setup where the ALB is
+public.
+
 ## Still TODO
 
 - **`JWT_SECRET` / `INTERNAL_TOKEN`** are plain Cloud Run env vars; AWS
   pulls them from Secrets Manager via the ECS task definition's
   `secrets` block. The GCP equivalent (Secret Manager + Cloud Run
   secret env volumes) is mechanical but not done in this PR.
-- **Cross-service URLs.** `TUYA_BRIDGE_URL` and `DEVICE_SERVICE_URL`
-  aren't set on Cloud Run yet — `device-service` ↔ `tuya-bridge`
-  Cloud Run URIs form a Terraform reference cycle that needs a
-  post-create gcloud step or a one-direction breaker. Until then,
-  command dispatch and state reporting between the two services
-  doesn't work. Health, login, and event ingest all do.
 - `push_images.sh`, `redeploy.sh`, `set_tuya_secrets.sh`, and
   `test_apis.sh` are still the AWS scripts — left as-is for now.
 
