@@ -96,17 +96,31 @@ plumbing.
   through `azure/terraform/modules/container-apps/main.tf`'s
   `DATABASE_URL` construction carefully.
 
-- **Cycle: `device-service` ↔ `tuya-bridge` URIs.** Both services need
-  each other's URL at startup; if both are in one `for_each` and both
-  declare `<other>.url` in their env, terraform errors with "cycle."
-  GCP's answer: pull `tuya-bridge` into a separate resource, set
-  `device-service`'s URL via Terraform reference, patch the other
-  direction in via a `null_resource` running `az containerapp update`
-  after both exist, and `lifecycle.ignore_changes = [...env]` on
-  `tuya-bridge` so the patch isn't seen as drift. See
-  `gcp/terraform/modules/cloud-run/main.tf` and `gcp/README.md`'s
-  "Cross-service URLs" section for the full pattern. Apply the same
-  shape to Container Apps.
+- **Cross-resource references force resource-block splits.** Terraform
+  forbids a `for_each` instance from referencing a sibling instance of
+  the same resource block ("self-referential block" error). The check
+  fires at plan time, not at `terraform validate`, so you only see it
+  on first real apply. The GCP module ended up with **three** Cloud
+  Run resource blocks for this reason:
+
+  1. `google_cloud_run_v2_service.main` — `automation`, `user`,
+     `analytics`. Plain `for_each`, no special treatment.
+  2. `google_cloud_run_v2_service.device_service` — split out because
+     `analytics-service` (in `main`) needs `DEVICE_SERVICE_URL =
+     device_service.uri` at create time, and a sibling-instance ref
+     would have tripped the self-reference check. Tuya-bridge also
+     needs this URI but gets it patched in post-create.
+  3. `google_cloud_run_v2_service.tuya_bridge` — split out for a
+     different reason: `lifecycle.ignore_changes = [...env]` so the
+     post-create `null_resource` patch (which adds
+     `DEVICE_SERVICE_URL` via `az containerapp update` /
+     `gcloud run services update`) doesn't show as drift.
+
+  **General rule for the Azure port:** any service that is the
+  *target* of a cross-reference from another `for_each` instance
+  **must** be in a separate resource block. Same for any service
+  needing `lifecycle.ignore_changes` on env for post-create patching.
+  See `gcp/terraform/modules/cloud-run/main.tf` for the full pattern.
 
 - **Secret IAM race.** First `terraform apply` can deadlock if the
   Container App tries to start before its identity has been granted

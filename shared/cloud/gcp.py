@@ -18,14 +18,22 @@ import asyncio
 import json
 import logging
 import os
-from typing import Optional
-
-from google.api_core.exceptions import DeadlineExceeded
-from google.cloud import pubsub_v1, secretmanager
+from typing import TYPE_CHECKING, Optional
 
 from .base import EventBus, IncomingEvent, SecretStore
 
+if TYPE_CHECKING:
+    from google.cloud import pubsub_v1
+
 logger = logging.getLogger(__name__)
+
+
+# SDK imports are deferred to per-class constructors. Importing this
+# module is free — only constructing PubSubEventBus pulls in
+# google-cloud-pubsub, and only constructing SecretManagerStore pulls
+# in google-cloud-secret-manager. That lets device-service /
+# analytics-service ship without google-cloud-secret-manager in their
+# requirements.txt, and tuya-bridge ship without google-cloud-pubsub.
 
 
 class PubSubEventBus(EventBus):
@@ -38,6 +46,11 @@ class PubSubEventBus(EventBus):
     """
 
     def __init__(self) -> None:
+        # Lazy SDK import so containers without google-cloud-pubsub
+        # installed can still import shared.cloud.gcp (e.g. tuya-bridge).
+        from google.cloud import pubsub_v1
+
+        self._pubsub_v1 = pubsub_v1
         self._project = os.environ.get("GCP_PROJECT", "")
         self._topic = os.environ.get("EVENT_TOPIC", "")
         self._subscription = os.environ.get("EVENT_SUBSCRIPTION", "")
@@ -48,14 +61,14 @@ class PubSubEventBus(EventBus):
         if not (self._project and self._topic):
             return None
         if self._publisher is None:
-            self._publisher = pubsub_v1.PublisherClient()
+            self._publisher = self._pubsub_v1.PublisherClient()
         return self._publisher
 
     def _ensure_subscriber(self) -> Optional[pubsub_v1.SubscriberClient]:
         if not (self._project and self._subscription):
             return None
         if self._subscriber is None:
-            self._subscriber = pubsub_v1.SubscriberClient()
+            self._subscriber = self._pubsub_v1.SubscriberClient()
         return self._subscriber
 
     async def publish(
@@ -78,6 +91,8 @@ class PubSubEventBus(EventBus):
     async def receive(
         self, max_messages: int = 10, wait_seconds: int = 10
     ) -> list[IncomingEvent]:
+        from google.api_core.exceptions import DeadlineExceeded
+
         sub = self._ensure_subscriber()
         if sub is None:
             await asyncio.sleep(wait_seconds)
@@ -155,6 +170,11 @@ class SecretManagerStore(SecretStore):
     """
 
     def __init__(self) -> None:
+        # Lazy SDK import so containers without google-cloud-secret-manager
+        # installed can still import shared.cloud.gcp (e.g. device-service,
+        # analytics-service — only tuya-bridge actually reads secrets).
+        from google.cloud import secretmanager
+
         self._project = os.environ.get("GCP_PROJECT", "")
         self._client = secretmanager.SecretManagerServiceClient()
 

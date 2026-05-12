@@ -24,19 +24,30 @@ Connector isn't needed for this topology.
 
 ## Cross-service URLs — how the cycle is broken
 
-`device-service` ↔ `tuya-bridge` need each other's `*.run.app` URI,
-which would form a Terraform reference cycle if both were declared
-inside the same `for_each`. The module breaks it by:
+The cloud-run module ends up with **three** `google_cloud_run_v2_service`
+resource blocks instead of one `for_each` over all five services:
 
-1. Pulling `tuya-bridge` out of the `for_each` into its own
-   `google_cloud_run_v2_service` resource. `device-service` references
-   that resource's `.uri` at create time (`TUYA_BRIDGE_URL` env var).
-2. Patching `DEVICE_SERVICE_URL` onto `tuya-bridge` *after* both
-   services exist via a `null_resource` that runs
-   `gcloud run services update --update-env-vars`.
-3. Setting `lifecycle.ignore_changes = [...env]` on the `tuya-bridge`
-   resource so the post-create patch isn't seen as drift on subsequent
-   plans.
+1. `google_cloud_run_v2_service.main` (automation, user, analytics) —
+   plain `for_each`.
+2. `google_cloud_run_v2_service.device_service` — split out because
+   Terraform forbids a `for_each` instance from referencing a sibling
+   instance ("self-referential block" at plan time). `analytics-service`
+   needs `DEVICE_SERVICE_URL = device_service.uri` at create time, and
+   the post-create `null_resource` patch onto `tuya-bridge` reads the
+   same URI.
+3. `google_cloud_run_v2_service.tuya_bridge` — split out for a
+   different reason: `lifecycle.ignore_changes = [...env]` so the
+   post-create patch that injects `DEVICE_SERVICE_URL` doesn't show as
+   Terraform drift on subsequent plans.
+
+The cycle itself is broken by:
+
+- `device-service` references `tuya_bridge.uri` at create time
+  (`TUYA_BRIDGE_URL` env var).
+- `tuya-bridge` receives `DEVICE_SERVICE_URL` *after* `device-service`
+  exists, via a `null_resource` running
+  `gcloud run services update --update-env-vars`.
+- `lifecycle.ignore_changes` on `tuya-bridge`'s env absorbs the patch.
 
 **Trade-off:** `tuya-bridge`'s env list is effectively "managed by
 null_resource" going forward. Terraform-declared changes to its env

@@ -1,14 +1,18 @@
 # =============================================================================
 # Cloud Run Module
 # =============================================================================
-# One google_cloud_run_v2_service per microservice. tuya-bridge is split
-# into its own resource because device-service and tuya-bridge need to
-# know each other's URIs and Cloud Run's for_each instance graph can't
-# express that cycle directly — device-service gets TUYA_BRIDGE_URL via
-# a Terraform reference at create time, tuya-bridge gets
-# DEVICE_SERVICE_URL via a null_resource patch after both exist. The
-# split lets us put lifecycle.ignore_changes on the tuya-bridge env
-# list so the post-create patch doesn't show as drift.
+# Three resource blocks for the five services:
+#   - google_cloud_run_v2_service.main         — automation, user, analytics
+#   - google_cloud_run_v2_service.device_service — split out because two
+#       other services need to reference its URI (analytics needs it at
+#       create time; tuya-bridge gets it patched in post-create). A
+#       for_each instance can't reference another instance of the same
+#       resource ("self-referential block"), so the targets of those
+#       cross-references must live in separate resource blocks.
+#   - google_cloud_run_v2_service.tuya_bridge  — split out so we can put
+#       lifecycle.ignore_changes on its env list (the null_resource
+#       patches DEVICE_SERVICE_URL in after device_service exists, which
+#       Terraform would otherwise see as drift).
 #
 # Trade-off: tuya-bridge env is effectively "managed by null_resource"
 # going forward. Terraform-declared changes to its env (e.g. rotating
@@ -102,10 +106,10 @@ locals {
 }
 
 # -----------------------------------------------------------------------------
-# Cloud Run services (everything except tuya-bridge)
+# Cloud Run services (automation, user, analytics)
 # -----------------------------------------------------------------------------
 resource "google_cloud_run_v2_service" "main" {
-  for_each = { for k, v in var.services : k => v if k != "tuya-bridge" }
+  for_each = { for k, v in var.services : k => v if k != "tuya-bridge" && k != "device-service" }
 
   name     = "${var.name_prefix}-${each.key}"
   location = var.region
@@ -220,31 +224,138 @@ resource "google_cloud_run_v2_service" "main" {
         name  = "SERVICE_NAME"
         value = each.key
       }
-      env {
-        name  = "PORT"
-        value = tostring(each.value.port)
-      }
-
-      # device-service publishes commands to tuya-bridge. Cross-service
-      # ref to the split tuya-bridge resource is acyclic because
-      # tuya-bridge env doesn't reference back.
-      dynamic "env" {
-        for_each = each.key == "device-service" ? [google_cloud_run_v2_service.tuya_bridge.uri] : []
-        content {
-          name  = "TUYA_BRIDGE_URL"
-          value = env.value
-        }
-      }
+      # PORT is injected by Cloud Run from ports.container_port — it's
+      # reserved and rejected if set explicitly.
 
       # analytics-service queries device-service for live counts.
-      # Intra-for_each reference (analytics depends on device-service)
-      # is acyclic — device-service doesn't reference analytics back.
+      # Cross-resource reference to the split device_service is acyclic.
       dynamic "env" {
-        for_each = each.key == "analytics-service" ? [google_cloud_run_v2_service.main["device-service"].uri] : []
+        for_each = each.key == "analytics-service" ? [google_cloud_run_v2_service.device_service.uri] : []
         content {
           name  = "DEVICE_SERVICE_URL"
           value = env.value
         }
+      }
+    }
+  }
+
+  lifecycle {
+    ignore_changes = [
+      client,
+      client_version,
+    ]
+  }
+}
+
+# -----------------------------------------------------------------------------
+# Cloud Run: device-service (split out because analytics + tuya-bridge
+# both need to reference its URI cross-resource)
+# -----------------------------------------------------------------------------
+resource "google_cloud_run_v2_service" "device_service" {
+  name     = "${var.name_prefix}-device-service"
+  location = var.region
+  ingress  = "INGRESS_TRAFFIC_ALL"
+
+  depends_on = [
+    google_secret_manager_secret_iam_member.app_secrets,
+    google_project_iam_member.cloud_sql_client,
+  ]
+
+  template {
+    service_account = google_service_account.services["device-service"].email
+
+    scaling {
+      min_instance_count = var.min_instances
+      max_instance_count = var.max_instances
+    }
+
+    volumes {
+      name = "cloudsql"
+      cloud_sql_instance {
+        instances = [var.db_connection_name]
+      }
+    }
+
+    containers {
+      image = var.image_urls["device-service"]
+
+      ports {
+        container_port = var.services["device-service"].port
+      }
+
+      resources {
+        limits = {
+          cpu    = var.services["device-service"].cpu
+          memory = var.services["device-service"].memory
+        }
+      }
+
+      volume_mounts {
+        name       = "cloudsql"
+        mount_path = "/cloudsql"
+      }
+
+      startup_probe {
+        http_get {
+          path = "/health"
+          port = var.services["device-service"].port
+        }
+        initial_delay_seconds = 10
+        period_seconds        = 10
+        timeout_seconds       = 5
+        failure_threshold     = 6
+      }
+
+      liveness_probe {
+        http_get {
+          path = "/health"
+          port = var.services["device-service"].port
+        }
+        period_seconds    = 30
+        timeout_seconds   = 5
+        failure_threshold = 3
+      }
+
+      dynamic "env" {
+        for_each = local.base_env
+        content {
+          name  = env.value.name
+          value = env.value.value
+        }
+      }
+
+      env {
+        name = "JWT_SECRET"
+        value_source {
+          secret_key_ref {
+            secret  = var.jwt_secret_id
+            version = "latest"
+          }
+        }
+      }
+      env {
+        name = "INTERNAL_TOKEN"
+        value_source {
+          secret_key_ref {
+            secret  = var.internal_token_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
+        name  = "SERVICE_NAME"
+        value = "device-service"
+      }
+      # PORT is reserved by Cloud Run — see note in the main block.
+
+      # device-service dispatches commands to tuya-bridge. Cross-resource
+      # ref is acyclic because tuya_bridge doesn't reference back at
+      # create time (DEVICE_SERVICE_URL is patched in post-create via
+      # null_resource).
+      env {
+        name  = "TUYA_BRIDGE_URL"
+        value = google_cloud_run_v2_service.tuya_bridge.uri
       }
     }
   }
@@ -362,10 +473,7 @@ resource "google_cloud_run_v2_service" "tuya_bridge" {
         name  = "SERVICE_NAME"
         value = "tuya-bridge"
       }
-      env {
-        name  = "PORT"
-        value = tostring(var.services["tuya-bridge"].port)
-      }
+      # PORT is reserved by Cloud Run — see note in the main block.
       # DEVICE_SERVICE_URL is added by null_resource.patch_tuya_bridge_url
       # after device-service exists. See lifecycle below — env changes
       # are ignored here so that patch doesn't show as Terraform drift.
@@ -402,7 +510,7 @@ resource "google_cloud_run_v2_service" "tuya_bridge" {
 resource "null_resource" "patch_tuya_bridge_url" {
   triggers = {
     tuya_bridge_name   = google_cloud_run_v2_service.tuya_bridge.name
-    device_service_uri = google_cloud_run_v2_service.main["device-service"].uri
+    device_service_uri = google_cloud_run_v2_service.device_service.uri
   }
 
   lifecycle {
@@ -417,7 +525,7 @@ resource "null_resource" "patch_tuya_bridge_url" {
       gcloud run services update "${google_cloud_run_v2_service.tuya_bridge.name}" \
         --region="${var.region}" \
         --project="${var.project_id}" \
-        --update-env-vars="DEVICE_SERVICE_URL=${google_cloud_run_v2_service.main["device-service"].uri}" \
+        --update-env-vars="DEVICE_SERVICE_URL=${google_cloud_run_v2_service.device_service.uri}" \
         --quiet >/dev/null
     EOT
   }
@@ -438,6 +546,14 @@ resource "google_cloud_run_v2_service_iam_member" "public_main" {
   project  = each.value.project
   location = each.value.location
   name     = each.value.name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "public_device_service" {
+  project  = google_cloud_run_v2_service.device_service.project
+  location = google_cloud_run_v2_service.device_service.location
+  name     = google_cloud_run_v2_service.device_service.name
   role     = "roles/run.invoker"
   member   = "allUsers"
 }
