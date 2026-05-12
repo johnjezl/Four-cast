@@ -71,22 +71,6 @@ variable "tuya_region" {
   default     = "us"
 }
 
-# =============================================================================
-# Feature Flags
-# =============================================================================
-
-variable "enable_iot_core" {
-  description = "Enable AWS IoT Core integration"
-  type        = bool
-  default     = true
-}
-
-variable "enable_timestream" {
-  description = "Enable Timestream for metrics (closed to new AWS customers since 2025)"
-  type        = bool
-  default     = false
-}
-
 variable "desired_count" {
   description = "Number of task replicas per microservice (set 2+ to demo the load balancer)"
   type        = number

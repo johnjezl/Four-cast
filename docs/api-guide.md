@@ -99,13 +99,26 @@ Devices, device templates, and state control. State changes propagate to the phy
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/v1/device/devices/{id}/state` | Current state (live from IoT shadow if `tuya_device_id` is set) |
+| GET | `/api/v1/device/devices/{id}/state` | Current state (merged view of reported + desired) |
 | PUT | `/api/v1/device/devices/{id}/state` | Set desired state; merges into existing |
 
 **State body:**
 ```json
 { "state": { "switch_led": true, "bright_value_v2": 800 } }
 ```
+
+**GET response shape:**
+```json
+{
+  "state":    { "switch_led": true, "bright_value_v2": 800 },
+  "desired":  { "switch_led": true },
+  "reported": { "bright_value_v2": 800, "last_sync": 1715472000 },
+  "version":  42,
+  "source":   "postgres"
+}
+```
+
+`state` is the user-facing flattened view (reported with desired overlaid). `desired` lists keys still pending convergence — these clear automatically as the bridge reports them back. `version` increments on every write and can be used for optimistic-concurrency checks if you need them.
 
 ### Convenience controls
 

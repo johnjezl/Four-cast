@@ -27,6 +27,9 @@ variable "services" {
     memory      = number
     health_path = string
     owner       = string
+    # ALB listener-rule priority. Explicit so adding a new service can't
+    # silently renumber existing rules.
+    priority = number
   }))
 }
 
@@ -49,17 +52,35 @@ variable "db_password" {
   sensitive = true
 }
 
-variable "jwt_secret" {
-  type      = string
-  sensitive = true
+variable "jwt_secret_arn" {
+  description = "Secrets Manager ARN for the JWT signing secret. Injected into containers via the task definition's `secrets` block."
+  type        = string
 }
 
-variable "iot_endpoint" {
-  type = string
+variable "internal_token_arn" {
+  description = "Secrets Manager ARN for the service-to-service auth token. Injected via `secrets` block."
+  type        = string
 }
 
 variable "device_events_queue" {
-  type = string
+  description = "SQS queue URL for device events; consumed by analytics-service"
+  type        = string
+}
+
+variable "tuya_secret_name" {
+  description = "Name of the Secrets Manager secret holding Tuya credentials"
+  type        = string
+}
+
+variable "tuya_secret_arn" {
+  description = "ARN of the Tuya Secrets Manager secret (for IAM scoping)"
+  type        = string
+}
+
+variable "tuya_device_ids" {
+  description = "Optional comma-separated allowlist of Tuya device IDs"
+  type        = string
+  default     = ""
 }
 
 variable "common_tags" {
