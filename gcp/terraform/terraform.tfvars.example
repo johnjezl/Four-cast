@@ -1,0 +1,39 @@
+# =============================================================================
+# Smart Home Hub Platform - Terraform Configuration
+# =============================================================================
+# Copy this file to terraform.tfvars and fill in your values
+# =============================================================================
+
+# AWS Configuration
+aws_region  = "us-east-1"
+environment = "dev"
+
+# Network
+vpc_cidr = "10.0.0.0/16"
+
+# Database (use strong passwords in production!)
+db_username = "smarthome_admin"
+db_password = "CHANGE_ME_STRONG_PASSWORD"
+
+# =============================================================================
+# Tuya Integration
+# =============================================================================
+# Get these from: https://iot.tuya.com → Cloud → Development → Your Project
+
+tuya_client_id     = "your_tuya_client_id"
+tuya_client_secret = "your_tuya_client_secret"
+tuya_region        = "us"  # us, eu, cn, in
+
+# Comma-separated list of Tuya device IDs to sync
+# Find in Tuya IoT Platform → Devices → All Devices → Device ID
+tuya_device_ids = "device_id_1,device_id_2"
+
+# =============================================================================
+# Feature Flags
+# =============================================================================
+
+# NOTE: AWS Timestream for LiveAnalytics is closed to new customers (mid-2025).
+# Only set this to true if your AWS account has existing Timestream access.
+enable_timestream = false
+
+enable_iot_core   = true
