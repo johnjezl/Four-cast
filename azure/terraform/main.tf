@@ -34,14 +34,32 @@ terraform {
 provider "azurerm" {
   features {}
 
-  subscription_id                 = var.azure_subscription_id
+  subscription_id = var.azure_subscription_id
+
+  # Let the azurerm provider itself handle resource provider registration.
+  # It registers idempotently (skips already-registered providers) and
+  # holds the dependency internally — every resource in the config waits
+  # for its provider namespace before creation, so no `depends_on` chain
+  # is needed.
+  #
+  # We use `"none"` for the preset (don't register anything we don't ask
+  # for) and list our seven explicitly via `resource_providers_to_register`.
+  # This is the alternative to the `azurerm_resource_provider_registration`
+  # resource pattern, which works but creates a destroy-cycle UX problem:
+  # `prevent_destroy` is needed to stop `terraform destroy` from
+  # unregistering the providers subscription-wide, but then the explicit
+  # `state rm` step makes every subsequent fresh-state apply error out
+  # with "already exists - to be managed via Terraform this resource
+  # needs to be imported into the State", requiring a manual import
+  # dance. The provider's built-in registration sidesteps the whole loop.
+  #
+  # Upgrade note: if your state still has `azurerm_resource_provider_registration`
+  # entries from the previous design, run `terraform state rm` on each one
+  # BEFORE applying this config — otherwise terraform plans them as destroys
+  # (the resource block no longer exists and `prevent_destroy` is gone), which
+  # would unregister them subscription-wide.
   resource_provider_registrations = "none"
-}
-
-data "azurerm_client_config" "current" {}
-
-resource "azurerm_resource_provider_registration" "required" {
-  for_each = toset([
+  resource_providers_to_register = [
     "Microsoft.App",
     "Microsoft.ContainerRegistry",
     "Microsoft.DBforPostgreSQL",
@@ -49,20 +67,10 @@ resource "azurerm_resource_provider_registration" "required" {
     "Microsoft.ManagedIdentity",
     "Microsoft.OperationalInsights",
     "Microsoft.ServiceBus",
-  ])
-
-  name = each.key
-
-  # Destroying these would unregister the providers from the entire
-  # subscription, breaking every other workload that uses them. Guard
-  # against `terraform destroy` taking the subscription down with the
-  # stack. To genuinely remove a registration: `terraform state rm` the
-  # entry first, then unregister manually with
-  # `az provider unregister --namespace <ns>` if intended.
-  lifecycle {
-    prevent_destroy = true
-  }
+  ]
 }
+
+data "azurerm_client_config" "current" {}
 
 resource "random_string" "suffix" {
   length  = 6
@@ -145,8 +153,6 @@ resource "azurerm_key_vault" "app" {
   purge_protection_enabled   = false
   soft_delete_retention_days = 7
   tags                       = local.common_tags
-
-  depends_on = [azurerm_resource_provider_registration.required]
 }
 
 # The identity running Terraform needs data-plane rights before it can
@@ -195,8 +201,6 @@ resource "azurerm_servicebus_namespace" "device_events" {
   resource_group_name = azurerm_resource_group.main.name
   sku                 = "Standard"
   tags                = local.common_tags
-
-  depends_on = [azurerm_resource_provider_registration.required]
 }
 
 resource "azurerm_servicebus_queue" "device_events_dlq" {
@@ -241,8 +245,6 @@ module "registry" {
   unique_suffix       = random_string.suffix.result
   services            = local.services
   tags                = local.common_tags
-
-  depends_on = [azurerm_resource_provider_registration.required]
 }
 
 # =============================================================================
@@ -258,8 +260,6 @@ module "database" {
   db_username         = var.db_username
   db_password         = var.db_password
   tags                = local.common_tags
-
-  depends_on = [azurerm_resource_provider_registration.required]
 }
 
 # =============================================================================
@@ -305,8 +305,6 @@ module "container_apps" {
   min_instances = var.min_instances
   max_instances = var.max_instances
   log_level     = var.log_level
-
-  depends_on = [azurerm_resource_provider_registration.required]
 }
 
 # =============================================================================

@@ -181,17 +181,17 @@ in this deployment.
   `azure_location`. Container Apps in the primary region make
   cross-region calls to Postgres — adds a few ms of latency and
   modest egress, but works.
-- **Pre-registered resource providers.** If `Microsoft.KeyVault`,
-  `Microsoft.ContainerRegistry`, etc. are already registered on the
-  subscription, `azurerm_resource_provider_registration` errors with
-  "already exists - to be managed via Terraform this resource needs to
-  be imported into the State." `terraform import` each one:
-  ```bash
-  SUB=$(az account show --query id -o tsv)
-  for NS in Microsoft.KeyVault Microsoft.ContainerRegistry Microsoft.OperationalInsights Microsoft.ManagedIdentity; do
-    terraform import "azurerm_resource_provider_registration.required[\"$NS\"]" "/subscriptions/$SUB/providers/$NS"
-  done
-  ```
+- **Pre-registered resource providers** are handled idempotently by the
+  azurerm provider's `resource_providers_to_register` config in
+  `main.tf` — already-registered namespaces are no-ops on apply, fresh
+  subscriptions get the seven we need (`Microsoft.App`,
+  `Microsoft.ContainerRegistry`, `Microsoft.DBforPostgreSQL`,
+  `Microsoft.KeyVault`, `Microsoft.ManagedIdentity`,
+  `Microsoft.OperationalInsights`, `Microsoft.ServiceBus`) registered as
+  part of provider init. No manual `az provider register` or
+  `terraform import` step is required, and the registrations are *not*
+  part of Terraform state — destroy never unregisters them
+  subscription-wide.
 - **Failed Postgres creates hold the name for ~24h.** If a first apply
   fails at Postgres creation, the resource name lingers in Azure's
   backend even though the resource doesn't show up in the API. Either
