@@ -772,6 +772,39 @@ async def publish_device_event(event_type: str, device: Device, data: dict = Non
         logger.error(f"Error publishing event: {e}")
 
 
+async def publish_telemetry_event(
+    device: Device,
+    readings: dict[str, float],
+    recorded_at: Optional[datetime],
+    received_at: datetime,
+) -> None:
+    """Publish device.telemetry to the bus with the payload shape the
+    design doc fixes (top-level `event`, `device_type`, `readings`,
+    both timestamps). Distinct from publish_device_event because the
+    telemetry payload is consumer-contract for analytics and
+    automation — flattening it under the generic envelope would mean
+    downstream consumers parse a different shape per event_type.
+
+    Per the doc: `recorded_at` on the bus is **always populated**,
+    falling back to `received_at` if the device didn't supply one.
+    This decouples the bus contract from the DB column's NULL
+    storage of unsupplied recorded_at."""
+    bus = get_event_bus()
+    effective_recorded_at = recorded_at if recorded_at is not None else received_at
+    body = {
+        "event": "device.telemetry",
+        "device_id": device.id,
+        "device_type": device.device_type_id,
+        "readings": readings,
+        "recorded_at": effective_recorded_at.isoformat(),
+        "received_at": received_at.isoformat(),
+    }
+    try:
+        await bus.publish(body, attributes={"event_type": "device.telemetry"})
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"telemetry bus publish failed for device {device.id}: {e}")
+
+
 # =============================================================================
 # Internal token guard
 # =============================================================================
@@ -1430,10 +1463,25 @@ async def receive_telemetry(
         index_elements=["device_id", "capability", "recorded_at"],
         index_where=text("recorded_at IS NOT NULL"),
     )
-    await session.execute(stmt)
+    result = await session.execute(stmt)
     await session.commit()
-    # PR5 will publish here, gated on whether any row was actually
-    # inserted (vs. swallowed by ON CONFLICT).
+
+    # Bus publish, gated on whether any row was actually inserted —
+    # ON CONFLICT DO NOTHING returns rowcount=0 when every reading was
+    # a duplicate of an existing (device, capability, recorded_at)
+    # tuple, and the doc skips publish in that case to avoid noisy
+    # duplicate-event fanout to consumers.
+    if result.rowcount and result.rowcount > 0:
+        # device_keys.device_id has FK ON DELETE CASCADE to devices.id,
+        # so a valid key always references a live device.
+        device = await session.get(Device, key.device_id)
+        if device is not None:
+            await publish_telemetry_event(
+                device,
+                readings={r["capability"]: r["value"] for r in rows},
+                recorded_at=payload.recorded_at,
+                received_at=received_at,
+            )
 
 
 # =============================================================================
