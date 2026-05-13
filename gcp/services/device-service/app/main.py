@@ -24,7 +24,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field as PydanticField
-from sqlalchemy import Column, Integer, cast, text
+from sqlalchemy import BigInteger, Column, DateTime, Float, ForeignKey, Index, Integer, cast, text
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -86,9 +86,110 @@ class Device(SQLModel, table=True):
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'::jsonb")),
     )
+    # Per-device-class static metadata (e.g. {"subtype": "shelly_ht_gen3"}).
+    # Distinct from `state` — `state` is the live shadow, `device_metadata`
+    # is registration-time vendor info that doesn't change at runtime.
+    # Named `device_metadata` rather than `metadata` because SQLAlchemy
+    # reserves `metadata` for the declarative-class registry; the SQL
+    # column and JSON field both use `device_metadata` for consistency.
+    device_metadata: dict = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False,
+                         server_default=text("'{}'::jsonb")),
+    )
     online: bool = False
     last_seen: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class DeviceKey(SQLModel, table=True):
+    """Per-device API key for the protocol/v1/* endpoints. Plaintext is
+    returned once at issuance; only the bcrypt hash is persisted. Scopes
+    gate which protocol endpoints the key can hit (the inherited
+    `device-protocol-design.md` defines read_pending/write_reported for
+    polling devices; this PR adds the schema, but write_telemetry — the
+    Shelly scope — is enforced by the receive endpoint in a later PR)."""
+    __tablename__ = "device_keys"
+    id: str = Field(
+        default_factory=lambda: str(uuid.uuid4()),
+        primary_key=True,
+    )
+    device_id: str = Field(
+        sa_column=Column(
+            ForeignKey("devices.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+    key_hash: str  # bcrypt of the issued plaintext key
+    key_prefix: str  # first ~8 chars of plaintext for UI display hints
+    scopes: list[str] = Field(
+        default_factory=lambda: ["read_pending", "write_reported"],
+        sa_column=Column(
+            JSONB,
+            nullable=False,
+            server_default=text("'[\"read_pending\", \"write_reported\"]'::jsonb"),
+        ),
+    )
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    last_used_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+
+
+class DeviceTelemetry(SQLModel, table=True):
+    """One row per (device, capability, reading). Long format because
+    `WHERE capability='temperature'` and per-capability aggregations are
+    the dominant query shape, and the row volume from sleep-cycle sensors
+    is trivial (~48 rows/device/day at default H&T cadence).
+
+    `recorded_at` is the device-supplied timestamp (NULL when the device
+    omits it — by design, distinguishes device-stamped from server-
+    stamped provenance). The partial unique index on (device_id,
+    capability, recorded_at) WHERE recorded_at IS NOT NULL lets the
+    receive endpoint use INSERT ... ON CONFLICT DO NOTHING to absorb
+    retried Shelly webhooks idempotently for the device-stamped case.
+    No `unit` column — the unit is recoverable from `capability` via
+    the CAPABILITIES registry."""
+    __tablename__ = "device_telemetry"
+    __table_args__ = (
+        Index(
+            "ix_telemetry_device_capability_received",
+            "device_id", "capability", "received_at",
+        ),
+        Index(
+            "uq_telemetry_recorded",
+            "device_id", "capability", "recorded_at",
+            unique=True,
+            postgresql_where=text("recorded_at IS NOT NULL"),
+        ),
+    )
+    id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(BigInteger, primary_key=True, autoincrement=True),
+    )
+    device_id: str = Field(
+        sa_column=Column(
+            ForeignKey("devices.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+    )
+    capability: str
+    value: float = Field(sa_column=Column(Float, nullable=False))
+    # timestamptz so device-supplied and server-stamped timestamps are
+    # comparable across timezones. Inherited `devices.created_at` is
+    # naive TIMESTAMP; deliberately not migrating that here.
+    recorded_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True),
+    )
+    received_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        sa_column=Column(
+            DateTime(timezone=True),
+            nullable=False,
+            server_default=text("now()"),
+        ),
+    )
 
 
 class DeviceCreate(BaseModel):
@@ -153,6 +254,22 @@ CAPABILITIES = {
         "enum": ["white", "colour", "scene", "music"],
         "description": "Bulb operating mode",
     },
+    # Sensor capabilities. Registered here in PR1 so the 'sensor' device
+    # type can declare them without tripping _sanity_check_device_types.
+    # The `read_only` flag and PUT /state rejection land in a later PR
+    # alongside the protocol/v1/telemetry receive endpoint.
+    "temperature": {
+        "type": "float",
+        "range": [-40.0, 180.0],
+        "unit": "fahrenheit",
+        "description": "Ambient temperature in Fahrenheit",
+    },
+    "humidity": {
+        "type": "float",
+        "range": [0.0, 100.0],
+        "unit": "percent",
+        "description": "Relative humidity as a percentage",
+    },
 }
 
 # Keys allowed in `reported` state that aren't capabilities — metadata
@@ -176,6 +293,15 @@ def _validate_value(capability: str, value) -> None:
                                 detail=f"{capability} must be an int")
         rng = spec.get("range")
         if rng and not (rng[0] <= value <= rng[1]):
+            raise HTTPException(status_code=400,
+                                detail=f"{capability} must be in {rng}, got {value}")
+    elif t == "float":
+        # Accept int as a valid float; reject bool (subclass of int).
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise HTTPException(status_code=400,
+                                detail=f"{capability} must be a number")
+        rng = spec.get("range")
+        if rng and not (rng[0] <= float(value) <= rng[1]):
             raise HTTPException(status_code=400,
                                 detail=f"{capability} must be in {rng}, got {value}")
     elif t == "string":
@@ -273,6 +399,19 @@ device_types_db: dict[str, DeviceType] = {
         manufacturer="Generic",
         capabilities=["power"],
         default_state={"power": False},
+    ),
+    # Generic sensor type — per the design doc, the device class is
+    # 'sensor' at the type level and vendor-specific identity lives in
+    # the per-device `device_metadata` jsonb column
+    # (e.g. {"subtype": "shelly_ht_gen3"}). default_state is empty
+    # because sensor readings are recorded in the device_telemetry
+    # table, not in the shadow envelope.
+    "sensor": DeviceType(
+        id="sensor",
+        name="Environmental Sensor",
+        manufacturer="Generic",
+        capabilities=["temperature", "humidity"],
+        default_state={},
     ),
 }
 
