@@ -13,6 +13,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import secrets
 import socket
 import time
 import uuid
@@ -20,6 +22,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Callable, Optional
 
+import bcrypt
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,7 +37,35 @@ from shared.cloud import event_bus
 
 from .db import engine, get_session, init_db
 
+
+# =============================================================================
+# Log scrubbing
+# =============================================================================
+# Defense in depth: redact device-key plaintext from any log record before
+# emission. The codebase doesn't deliberately log header values, but
+# third-party libs (httpx debug, sqlalchemy echo) occasionally do. The
+# filter rewrites `dvk_<chars>` patterns in the formatted message so a
+# leaked-key won't end up in Cloud Logging / CloudWatch.
+
+_KEY_PATTERN = re.compile(r"\b(dvk|shk)_[A-Za-z0-9_\-]{8,}")
+
+
+class _ScrubKeyPlaintextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            if _KEY_PATTERN.search(msg):
+                record.msg = _KEY_PATTERN.sub(r"\1_***", msg)
+                record.args = ()
+        except Exception:
+            # A filter that raises kills the log call site — never let
+            # a bug here drop log lines on the floor.
+            pass
+        return True
+
+
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
+logging.getLogger().addFilter(_ScrubKeyPlaintextFilter())
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -211,6 +242,130 @@ class CommandRequest(BaseModel):
 class ReportedStateUpdate(BaseModel):
     tuya_device_id: str
     reported: dict
+
+
+class DeviceKeyCreate(BaseModel):
+    """Optional scopes override on issuance. Defaults to the inherited
+    polling-device scopes; Shelly-style sensors should pass
+    `["write_telemetry"]`."""
+    scopes: Optional[list[str]] = None
+
+
+class DeviceKeyIssued(BaseModel):
+    """Response shape for POST /devices/{id}/keys — includes the
+    plaintext key, returned **once** at issuance."""
+    id: str
+    device_id: str
+    key: str          # plaintext, only returned at issuance
+    key_prefix: str
+    scopes: list[str]
+    created_at: datetime
+
+
+class DeviceKeyInfo(BaseModel):
+    """Response shape for GET /devices/{id}/keys — no plaintext."""
+    id: str
+    device_id: str
+    key_prefix: str
+    scopes: list[str]
+    created_at: datetime
+    last_used_at: Optional[datetime]
+    revoked_at: Optional[datetime]
+
+
+# =============================================================================
+# Device-key auth (issuance, hashing, lookup)
+# =============================================================================
+# Plaintext format: `dvk_` + 32-byte url-safe random token. The full
+# plaintext is the X-Device-Key value the device firmware sends; the
+# server persists only the bcrypt hash. The `dvk_` prefix is for human
+# readability in logs / UIs ("that's clearly a device key") and is
+# included in the bcrypt input — no special trimming.
+#
+# Known limitations the design doc flagged for higher-volume devices:
+# - bcrypt cost is paid on every authenticated request. Fine at H&T's
+#   ~1 hit/hour/device, becomes a hot path for streaming-rate sensors.
+# - Verification scans all non-revoked keys (no index hint on
+#   key_prefix). Acceptable at class-project scale; revisit at >10^3
+#   keys.
+
+_BCRYPT_ROUNDS = 12  # bcrypt's default; ~250ms on modest hardware
+
+
+def generate_device_key() -> str:
+    """Generate a fresh plaintext key. Returned to the caller once;
+    never persisted in this form."""
+    return f"dvk_{secrets.token_urlsafe(32)}"
+
+
+def hash_device_key(plaintext: str) -> str:
+    return bcrypt.hashpw(plaintext.encode(), bcrypt.gensalt(_BCRYPT_ROUNDS)).decode()
+
+
+def _key_prefix(plaintext: str) -> str:
+    """First 8 chars of the plaintext — stored for UI display hints
+    (`dvk_AbCd...`). Not used as a lookup index in PR2; if/when the
+    `device_keys` table grows large, add an index and filter the
+    bcrypt scan by prefix first."""
+    return plaintext[:8]
+
+
+async def require_device_key(
+    x_device_key: Optional[str] = Header(None),
+    session: AsyncSession = Depends(get_session),
+) -> DeviceKey:
+    """FastAPI dependency: resolves an X-Device-Key header to its
+    DeviceKey row. 401 on missing/malformed/unknown/revoked.
+
+    Bumps `last_used_at` on each successful auth. At H&T volume this
+    extra write per request is fine; at streaming-rate volumes it would
+    want to be batched or sampled."""
+    if not x_device_key or not x_device_key.startswith("dvk_"):
+        # Same generic message as the no-match branch below — don't
+        # leak format-correctness signal to probing clients.
+        raise HTTPException(status_code=401, detail="invalid or missing X-Device-Key")
+
+    # Linear scan over non-revoked keys. The bcrypt check is the hot
+    # cost; the SQL scan is cheap by comparison.
+    candidates = (await session.execute(
+        select(DeviceKey).where(DeviceKey.revoked_at.is_(None))
+    )).scalars().all()
+
+    matched: Optional[DeviceKey] = None
+    for row in candidates:
+        try:
+            if bcrypt.checkpw(x_device_key.encode(), row.key_hash.encode()):
+                matched = row
+                break
+        except ValueError:
+            # Malformed hash on a row — log and skip, don't 500 the request.
+            logger.warning(f"device_keys row {row.id} has malformed hash; skipping")
+            continue
+
+    if matched is None:
+        # Same 401 for "unknown key", "revoked key", and "malformed
+        # format" so a probing client can't tell which condition fired.
+        raise HTTPException(status_code=401, detail="invalid or missing X-Device-Key")
+
+    matched.last_used_at = datetime.utcnow()
+    session.add(matched)
+    await session.commit()
+    await session.refresh(matched)
+    return matched
+
+
+def require_scope(scope: str) -> Callable:
+    """Dependency factory: returns a dependency that asserts the
+    authenticated key carries `scope` in its scopes list. Use as e.g.
+    `Depends(require_scope("write_telemetry"))`."""
+    async def _check(key: DeviceKey = Depends(require_device_key)) -> DeviceKey:
+        if scope not in (key.scopes or []):
+            raise HTTPException(
+                status_code=403,
+                detail=f"key lacks required scope: {scope}",
+            )
+        return key
+    return _check
 
 
 # =============================================================================
@@ -751,6 +906,119 @@ async def delete_device(device_id: str, session: AsyncSession = Depends(get_sess
     await session.delete(device)
     await session.commit()
     return {"message": f"Device {device_id} deleted"}
+
+
+# =============================================================================
+# Device-key management
+# =============================================================================
+# Issue / list / revoke per-device API keys used by direct-protocol
+# devices (Shelly H&T and future direct WiFi devices) to authenticate
+# against the /protocol/v1/* endpoints.
+#
+# TODO(auth): The design doc calls these "admin only." The platform has
+# no admin role today (no admin column, no role enforcement in any
+# other device-service endpoint — POST/DELETE /devices are also
+# ungated). Match that posture here and tighten when platform-wide
+# admin/ownership lands.
+
+_DEFAULT_KEY_SCOPES = ["read_pending", "write_reported"]
+
+
+@app.post(
+    "/api/v1/device/devices/{device_id}/keys",
+    tags=["Device Keys"],
+    status_code=201,
+    response_model=DeviceKeyIssued,
+)
+async def issue_device_key(
+    device_id: str,
+    body: DeviceKeyCreate,
+    session: AsyncSession = Depends(get_session),
+):
+    """Issue a fresh API key for a device. The plaintext is returned
+    exactly once; only the bcrypt hash is persisted."""
+    device = await session.get(Device, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    plaintext = generate_device_key()
+    row = DeviceKey(
+        device_id=device_id,
+        key_hash=hash_device_key(plaintext),
+        key_prefix=_key_prefix(plaintext),
+        scopes=list(body.scopes) if body.scopes is not None else list(_DEFAULT_KEY_SCOPES),
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+
+    return DeviceKeyIssued(
+        id=row.id,
+        device_id=row.device_id,
+        key=plaintext,
+        key_prefix=row.key_prefix,
+        scopes=row.scopes,
+        created_at=row.created_at,
+    )
+
+
+@app.get(
+    "/api/v1/device/devices/{device_id}/keys",
+    tags=["Device Keys"],
+    response_model=list[DeviceKeyInfo],
+)
+async def list_device_keys(
+    device_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """List all keys for a device. Plaintext is never returned —
+    callers see prefix, scopes, and lifecycle timestamps only."""
+    device = await session.get(Device, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    rows = (await session.execute(
+        select(DeviceKey).where(DeviceKey.device_id == device_id)
+        .order_by(DeviceKey.created_at)
+    )).scalars().all()
+
+    return [
+        DeviceKeyInfo(
+            id=r.id,
+            device_id=r.device_id,
+            key_prefix=r.key_prefix,
+            scopes=r.scopes,
+            created_at=r.created_at,
+            last_used_at=r.last_used_at,
+            revoked_at=r.revoked_at,
+        )
+        for r in rows
+    ]
+
+
+@app.delete(
+    "/api/v1/device/devices/{device_id}/keys/{key_id}",
+    tags=["Device Keys"],
+    status_code=204,
+)
+async def revoke_device_key(
+    device_id: str,
+    key_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """Soft-delete: stamp revoked_at. require_device_key rejects
+    revoked rows on subsequent auth attempts. Hard delete is not
+    supported here — keeping the row preserves audit history of which
+    key was used when."""
+    row = await session.get(DeviceKey, key_id)
+    if not row or row.device_id != device_id:
+        raise HTTPException(status_code=404, detail="Key not found for device")
+    if row.revoked_at is not None:
+        # Idempotent: already revoked is fine.
+        return
+    row.revoked_at = datetime.utcnow()
+    session.add(row)
+    await session.commit()
 
 
 # =============================================================================
