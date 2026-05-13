@@ -399,9 +399,13 @@ async def get_execution_history(
 # tuya-bridge, so each step lands in ~500ms. The 60s tuya-bridge poll
 # loop is irrelevant here — it's a separate reconciliation path.
 
-# Cap total chase duration well under Cloud Run's 300s request
-# timeout so the request can't be killed mid-animation, leaving
-# bulbs in whatever frame they last received.
+# Cap total chase duration well under the upstream request timeout
+# so the request can't be killed mid-animation, leaving bulbs in
+# whatever frame they last received. The 300s ceiling holds across
+# clouds: Cloud Run's default request timeout is 300s; the AWS ALB
+# idle_timeout is set to 300s in aws/terraform/modules/ecs/main.tf
+# (default would be 60s — explicitly raised so the chase math
+# matches Cloud Run). 270000ms gives a 30s cushion under that.
 MAX_CHASE_DURATION_MS = 270_000
 
 
@@ -466,7 +470,7 @@ async def run_chase(req: ChaseRequest):
     # do: `cycles * n` rotation-frame sleeps plus the one settling sleep
     # after the pre-zero frame. HTTP round-trip time during prefire and
     # per frame is variable and ignored here; the 30s cushion between
-    # this cap and Cloud Run's 300s request timeout absorbs it.
+    # this cap and the platform's 300s upstream timeout absorbs it.
     projected_ms = (req.cycles * n + 1) * req.step_ms
     if projected_ms > MAX_CHASE_DURATION_MS:
         raise HTTPException(

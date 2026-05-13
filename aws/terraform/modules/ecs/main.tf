@@ -90,6 +90,14 @@ resource "aws_lb" "main" {
   security_groups    = [aws_security_group.alb.id]
   subnets            = var.public_subnet_ids
 
+  # AWS default is 60s. The automation-service /chase endpoint holds the
+  # request open while it animates frames; with the in-app cap of 270s
+  # and 30s of HTTP-RTT cushion, the LB ceiling needs to be ≥300s or
+  # the ALB resets long-running requests before the handler returns.
+  # Matches Cloud Run's default 300s request timeout so the chase math
+  # is identical across clouds.
+  idle_timeout = 300
+
   tags = var.common_tags
 }
 
