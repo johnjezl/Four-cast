@@ -7,8 +7,11 @@
 #
 # First-apply note: the three `tcp_keepalives_*` server parameters are
 # static parameters, so each one triggers a server restart at create
-# time. Expect ~60-90s extra on first apply for the parameter changes
-# to land. Subsequent applies are no-ops unless the values change.
+# time (~3-5 min total). They're applied via `az` CLI in a
+# null_resource rather than as `azurerm_postgresql_flexible_server_
+# configuration` resources, because the latter form makes destroy
+# pay the same restart cost in reverse for each parameter (~30 min
+# total) — see the comment on null_resource.tcp_keepalives below.
 # =============================================================================
 
 resource "azurerm_postgresql_flexible_server" "main" {
@@ -51,32 +54,60 @@ resource "azurerm_postgresql_flexible_server_firewall_rule" "azure_services" {
   server_id        = azurerm_postgresql_flexible_server.main.id
   start_ip_address = "0.0.0.0"
   end_ip_address   = "0.0.0.0"
+
+  # Default delete timeout is 30 min. Bump for safety because the
+  # firewall-rule delete can be queued behind other server-scoped
+  # operations and the polling deadline expires before Azure
+  # acknowledges completion — even when the rule actually deleted.
+  # 60 min absorbs that.
+  timeouts {
+    delete = "60m"
+  }
 }
 
 # Aggressive TCP keepalives so Postgres detects dead sessions quickly.
 # Defaults (tcp_keepalives_idle = 7200s / 2h) let Container Apps
-# teardowns leave orphaned sessions in pg_stat_activity for hours,
-# which blocks `DROP DATABASE` on destroy. With these the server reaps
-# a dead session in ~90s (60s idle + 3 × 10s probes). Helpful for
-# normal-operation disconnects (dev-machine network blips, scaled-down
-# containers); not sufficient alone to make destroy reliable — see the
-# restart null_resource below.
-resource "azurerm_postgresql_flexible_server_configuration" "tcp_keepalives_idle" {
-  name      = "tcp_keepalives_idle"
-  server_id = azurerm_postgresql_flexible_server.main.id
-  value     = "60"
-}
+# teardowns leave orphaned sessions in pg_stat_activity for hours.
+# With these the server reaps a dead session in ~90s
+# (60s idle + 3 × 10s probes).
+#
+# Set via az CLI rather than three separate
+# `azurerm_postgresql_flexible_server_configuration` resources. Reason:
+# each configuration resource is a server-static parameter, and Azure
+# restarts the Flexible Server to apply it both on create AND on revert
+# during destroy. Three of them sequentially destroying = ~30 minutes
+# tacked onto every `terraform destroy` (verified in the field).
+# Moving them to a null_resource means the values are still set at
+# create time, the same restart cost is paid up front, but terraform
+# doesn't try to revert them on destroy — the server takes them with
+# it when it's destroyed.
+resource "null_resource" "tcp_keepalives" {
+  triggers = {
+    server_name         = azurerm_postgresql_flexible_server.main.name
+    resource_group_name = var.resource_group_name
+    # Re-fire if any value changes.
+    idle     = "60"
+    interval = "10"
+    probes   = "3"
+  }
 
-resource "azurerm_postgresql_flexible_server_configuration" "tcp_keepalives_interval" {
-  name      = "tcp_keepalives_interval"
-  server_id = azurerm_postgresql_flexible_server.main.id
-  value     = "10"
-}
-
-resource "azurerm_postgresql_flexible_server_configuration" "tcp_keepalives_count" {
-  name      = "tcp_keepalives_count"
-  server_id = azurerm_postgresql_flexible_server.main.id
-  value     = "3"
+  provisioner "local-exec" {
+    command = <<-EOT
+      set -e
+      az postgres flexible-server parameter set \
+        --server-name ${self.triggers.server_name} \
+        --resource-group ${self.triggers.resource_group_name} \
+        --name tcp_keepalives_idle --value ${self.triggers.idle}
+      az postgres flexible-server parameter set \
+        --server-name ${self.triggers.server_name} \
+        --resource-group ${self.triggers.resource_group_name} \
+        --name tcp_keepalives_interval --value ${self.triggers.interval}
+      az postgres flexible-server parameter set \
+        --server-name ${self.triggers.server_name} \
+        --resource-group ${self.triggers.resource_group_name} \
+        --name tcp_keepalives_count --value ${self.triggers.probes}
+    EOT
+  }
 }
 
 # Force-kill any lingering Postgres sessions immediately before the
@@ -105,15 +136,12 @@ resource "null_resource" "terminate_db_connections" {
     resource_group_name = var.resource_group_name
   }
 
-  # All server-scoped children (database + configurations) destroy before
-  # the restart fires. Reverses to create-time: server → configurations →
-  # database → this. Without configs in depends_on, terraform could
-  # destroy them in parallel with the restart — harmless but graph-untidy.
+  # All server-scoped children (database + tcp_keepalives null_resource)
+  # destroy before the restart fires. Reverses to create-time:
+  # server → tcp_keepalives → database → this.
   depends_on = [
     azurerm_postgresql_flexible_server_database.main,
-    azurerm_postgresql_flexible_server_configuration.tcp_keepalives_idle,
-    azurerm_postgresql_flexible_server_configuration.tcp_keepalives_interval,
-    azurerm_postgresql_flexible_server_configuration.tcp_keepalives_count,
+    null_resource.tcp_keepalives,
   ]
 
   provisioner "local-exec" {
