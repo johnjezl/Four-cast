@@ -10,6 +10,7 @@ guarded by X-Internal-Token.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -19,15 +20,17 @@ import socket
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
 
 import bcrypt
 import httpx
+import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field as PydanticField
-from sqlalchemy import BigInteger, Column, DateTime, Float, ForeignKey, Index, Integer, cast, text
+from sqlalchemy import BigInteger, Column, DateTime, Float, ForeignKey, Index, Integer, and_, cast, or_, text
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -74,6 +77,14 @@ logger = logging.getLogger(__name__)
 
 TUYA_BRIDGE_URL = os.getenv("TUYA_BRIDGE_URL", "").rstrip("/")
 INTERNAL_TOKEN = os.getenv("INTERNAL_TOKEN", "")
+
+# Shared JWT secret with user-service. user-service issues tokens at
+# login; device-service only verifies them on read endpoints. HS256
+# matches user-service's signing algorithm.
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+JWT_ALG = "HS256"
+
+_jwt_bearer = HTTPBearer(auto_error=False)
 
 # Retry policy for stuck desired-state commands. The tuya-bridge polls
 # /internal/pending each tick; this endpoint filters by these bounds so a
@@ -253,6 +264,23 @@ class TelemetryPayload(BaseModel):
     recorded_at: Optional[datetime] = None
 
 
+class TelemetryReading(BaseModel):
+    """One row of telemetry in a GET response."""
+    capability: str
+    value: float
+    recorded_at: Optional[datetime]
+    received_at: datetime
+
+
+class TelemetryPage(BaseModel):
+    """Response shape for GET /devices/{id}/telemetry. `next_cursor`
+    is null on the last page; pass it back as the `cursor` query
+    parameter to fetch the next page."""
+    device_id: str
+    readings: list[TelemetryReading]
+    next_cursor: Optional[str]
+
+
 class DeviceKeyCreate(BaseModel):
     """Optional scopes override on issuance. Defaults to the inherited
     polling-device scopes; Shelly-style sensors should pass
@@ -361,6 +389,32 @@ async def require_device_key(
     await session.commit()
     await session.refresh(matched)
     return matched
+
+
+def require_jwt(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_jwt_bearer),
+) -> str:
+    """Verify a Bearer JWT issued by user-service. Returns the `sub`
+    (user_id) on success. 401 on missing / invalid / expired.
+
+    The platform has no per-user device ownership in v1, so this
+    dependency only asserts "some authenticated user" — it doesn't
+    check that the caller owns the device they're reading. The
+    design doc calls this out explicitly: telemetry GET follows the
+    same gate as the rest of the device API (which today is also
+    JWT-only, no ownership)."""
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALG])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    sub = payload.get("sub")
+    if not sub:
+        raise HTTPException(status_code=401, detail="Token missing sub")
+    return sub
 
 
 def require_scope(scope: str) -> Callable:
@@ -751,6 +805,11 @@ async def lifespan(app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient()
     _sanity_check_device_types()
+    # Fail fast on missing JWT_SECRET — matches user-service. Without
+    # this, require_jwt would accept any (or no) token and silently
+    # expose JWT-gated endpoints to anonymous callers in production.
+    if not JWT_SECRET:
+        raise RuntimeError("JWT_SECRET env var is required")
     logger.info("Device Service starting...")
     await init_db()
     try:
@@ -1375,6 +1434,118 @@ async def receive_telemetry(
     await session.commit()
     # PR5 will publish here, gated on whether any row was actually
     # inserted (vs. swallowed by ON CONFLICT).
+
+
+# =============================================================================
+# Telemetry read API
+# =============================================================================
+# Time-ordered, paginated read of a device's telemetry. JWT-gated; no
+# per-user device ownership in v1 (the platform doesn't model
+# ownership anywhere yet — see require_jwt).
+#
+# Pagination uses a composite cursor over (received_at, id) rather
+# than received_at alone — burst inserts within the same now()
+# microsecond can produce ties, and a timestamp-only cursor would
+# skip or duplicate at page boundaries. Order is DESCENDING (newest
+# first) since that matches dashboard / debugging UX.
+
+
+def _encode_cursor(received_at: datetime, row_id: int) -> str:
+    """Opaque base64 of `<isoformat>|<id>`. Clients shouldn't parse it."""
+    raw = f"{received_at.isoformat()}|{row_id}".encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> tuple[datetime, int]:
+    """Reverse of _encode_cursor. Raises HTTPException(400) on any parse
+    failure — malformed cursors are a client error, not server error."""
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode()).decode()
+        iso, _, row_id_str = raw.partition("|")
+        return datetime.fromisoformat(iso), int(row_id_str)
+    except (ValueError, UnicodeDecodeError, base64.binascii.Error) as e:
+        raise HTTPException(status_code=400, detail=f"invalid cursor: {e}")
+
+
+@app.get(
+    "/api/v1/device/devices/{device_id}/telemetry",
+    tags=["Telemetry"],
+    response_model=TelemetryPage,
+)
+async def get_device_telemetry(
+    device_id: str,
+    since: Optional[datetime] = Query(
+        None,
+        description="Lower bound on received_at (ISO8601). Defaults to 24h ago.",
+    ),
+    capability: Optional[str] = Query(
+        None,
+        description="Filter to a single capability (e.g. 'temperature').",
+    ),
+    limit: int = Query(1000, ge=1, le=10000),
+    cursor: Optional[str] = Query(
+        None,
+        description="Opaque pagination cursor from a prior page's next_cursor.",
+    ),
+    session: AsyncSession = Depends(get_session),
+    _: str = Depends(require_jwt),
+):
+    device = await session.get(Device, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    if since is None:
+        since = datetime.utcnow() - timedelta(hours=24)
+
+    stmt = select(DeviceTelemetry).where(
+        DeviceTelemetry.device_id == device_id,
+        DeviceTelemetry.received_at >= since,
+    )
+    if capability is not None:
+        stmt = stmt.where(DeviceTelemetry.capability == capability)
+
+    if cursor is not None:
+        c_received, c_id = _decode_cursor(cursor)
+        # DESC order: next page is rows strictly before the cursor.
+        # `(received_at, id) < (c_received, c_id)` lexicographically.
+        stmt = stmt.where(
+            or_(
+                DeviceTelemetry.received_at < c_received,
+                and_(
+                    DeviceTelemetry.received_at == c_received,
+                    DeviceTelemetry.id < c_id,
+                ),
+            )
+        )
+
+    stmt = stmt.order_by(
+        DeviceTelemetry.received_at.desc(),
+        DeviceTelemetry.id.desc(),
+    ).limit(limit + 1)  # Fetch one extra to know if there's another page
+
+    rows = (await session.execute(stmt)).scalars().all()
+
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    next_cursor = None
+    if has_more and page:
+        last = page[-1]
+        next_cursor = _encode_cursor(last.received_at, last.id)
+
+    return TelemetryPage(
+        device_id=device_id,
+        readings=[
+            TelemetryReading(
+                capability=r.capability,
+                value=r.value,
+                recorded_at=r.recorded_at,
+                received_at=r.received_at,
+            )
+            for r in page
+        ],
+        next_cursor=next_cursor,
+    )
 
 
 if __name__ == "__main__":
