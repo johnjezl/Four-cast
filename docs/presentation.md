@@ -246,26 +246,26 @@ Read-only consumer of the event stream.
 
 ## Slide 10 — Per-Platform Services Comparison
 
-| Concern               | AWS                         | GCP                                  |
-|-----------------------|-----------------------------|--------------------------------------|
-| Compute               | ECS Fargate behind ALB      | Cloud Run v2 (per-service URLs)      |
-| Container registry    | ECR                         | Artifact Registry                    |
-| Database              | RDS Postgres (private VPC)  | Cloud SQL Postgres (Auth Proxy)      |
-| Event bus             | SQS queue + DLQ + redrive   | Pub/Sub topic + sub + DL topic       |
-| Secrets               | Secrets Manager             | Secret Manager                       |
-| Service identity      | One task role + scoped role | One service account per service      |
-| Inbound               | API Gateway → ALB           | Direct `*.run.app` per service       |
+| Concern            | AWS                         | GCP                              | Azure                                       |
+|--------------------|-----------------------------|----------------------------------|---------------------------------------------|
+| Compute            | ECS Fargate behind ALB      | Cloud Run v2 (per-service URLs)  | Container Apps (per-service URLs)           |
+| Container registry | ECR                         | Artifact Registry                | Azure Container Registry                    |
+| Database           | RDS Postgres (private VPC)  | Cloud SQL Postgres (Auth Proxy)  | Postgres Flexible Server (public + firewall)|
+| Event bus          | SQS queue + DLQ + redrive   | Pub/Sub topic + sub + DL topic   | Service Bus queue + DLQ                     |
+| Secrets            | Secrets Manager             | Secret Manager                   | Key Vault                                   |
+| Service identity   | One task role + scoped role | One service account per service  | One managed identity per service            |
+| Inbound            | API Gateway → ALB           | Direct `*.run.app` per service   | Direct `*.azurecontainerapps.io` per service|
 
 How these choices shaped the design:
-- **ALB is one URL → API Gateway sits in front uniformly.** Cloud Run gives N URLs → no shared gateway, so we leaned on app-level `INTERNAL_TOKEN` for inter-service auth on both clouds (uniform behavior).
-- **VPC vs Auth Proxy.** RDS lives in private subnets; Cloud SQL is reached over the public endpoint via the Auth Proxy unix socket. `DATABASE_URL` format differs but service code doesn't change.
-- **Per-cloud identities are isomorphic** — one runtime principal per service in both, scoped to exactly what that service needs.
+- **AWS is the odd one out on inbound.** ALB is a single URL fronted by API Gateway; GCP and Azure both give per-service URLs. App-level `INTERNAL_TOKEN` handles inter-service auth uniformly across all three.
+- **Three different database-connectivity stories.** AWS RDS lives in private subnets; GCP Cloud SQL is reached via the Auth Proxy unix socket; Azure Postgres uses a public IP with a firewall allow-rule. `DATABASE_URL` format differs but service code doesn't change.
+- **Per-cloud identities are isomorphic** — one runtime principal per service across all three, scoped to exactly what that service needs.
 
 ---
 
 ## Slide 11 — Per-Platform Cost Comparison
 
-Rough monthly cost for the demo stack as deployed (single region, demo sizing).
+Rough monthly cost for the demo stack as deployed (single region, demo sizing, comparable warm-replica counts).
 
 **AWS — ~$140 / month**
 - ECS Fargate (5 svc × small task): ~$75
@@ -274,16 +274,19 @@ Rough monthly cost for the demo stack as deployed (single region, demo sizing).
 - NAT Gateway (for private subnet egress): ~$32
 - API Gateway, SQS, ECR: free tier
 
-**GCP — ~$110 / month (at `min_instances = 2`)**
+**GCP — ~$110 / month** (at `min_instances = 2`)
 - Cloud Run (10 always-allocated vCPU): ~$100
 - Cloud SQL db-f1-micro: ~$10
 - Pub/Sub, Artifact Registry, Secret Manager: free tier / negligible
 
-**GCP — ~$15 / month at `min_instances = 0`**
-- Pay-per-request; cold-start latency on first hit
-- Right setting for an idle stack between demos
+**Azure — ~$80 / month** (at `min_replicas = 1`)
+- Container Apps (5 svc × 1 idle replica × 1 vCPU): ~$45
+- Postgres Flexible Server B1ms: ~$15
+- Service Bus Standard: ~$10
+- Azure Container Registry Basic: ~$5
+- Key Vault: free tier
 
-Take-away: at demo scale the two clouds are within ~25% of each other; the bigger lever is `min_instances`, not cloud choice.
+Take-away: at demo scale the three clouds cluster within ~$60 of each other. Biggest lever is replica count, not cloud choice — Azure scales-to-zero between demos for ~$30/month idle.
 
 ---
 
