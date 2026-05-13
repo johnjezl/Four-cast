@@ -2,37 +2,159 @@
 # =============================================================================
 # Exercise microservice API endpoints — either all at once or one at a time
 # =============================================================================
-#   bash ./aws/test_apis.sh                          # Run the full test suite
-#   bash ./aws/test_apis.sh --list                   # List individual operations
-#   bash ./aws/test_apis.sh --help                   # Same as --list
-#   bash ./aws/test_apis.sh <op> [--flag value ...]  # Run one operation
+# Single script for all three clouds (AWS / GCP / Azure). The cloud-specific
+# part is just the set of per-service URLs, which can be supplied four ways
+# (highest priority first):
 #
-#   BASE_URL=https://...    # override the API base (default: from terraform output)
+#   SERVICE_URLS_JSON='{...}'         ./test_apis.sh      # raw JSON map
+#   ./test_apis.sh --urls-file ./aws-urls.txt             # captured-output file
+#   ./test_apis.sh --platform aws                         # cd <p>/terraform && terraform output
+#   ./test_apis.sh                                        # cwd has terraform/
 #
-# After `login`, the JWT is saved to /tmp/smarthome-jwt and re-used by subsequent
-# authenticated calls until you run `logout` or `logout-local`.
+# `--platform aws|gcp|azure` runs `terraform output -json service_urls` in
+# `./<platform>/terraform/` — same as the legacy per-cloud scripts did,
+# minus the directory ritual. `--urls-file` reads a captured snapshot
+# instead, which is useful when you don't want to depend on a terraform
+# state file (different machine, locked workspace, frozen demo state).
 #
-# Requires: curl, jq
+# The urls-file format is what `terraform output service_urls` prints by
+# default — an HCL-ish map:
+#
+#     service_urls = {
+#       "analytics-service"  = "http://alb.example/api/v1/analytics"
+#       "automation-service" = "http://alb.example/api/v1/automation"
+#       "device-service"     = "http://alb.example/api/v1/device"
+#       "tuya-bridge"        = "http://alb.example/api/v1/tuya-bridge"
+#       "user-service"       = "http://alb.example/api/v1/user"
+#     }
+#
+# Capture it once with `terraform output service_urls > urls.txt`.
+#
+# URL normalization: a trailing `/api/v1/<anything>` is stripped from each
+# value before routing. That lets the same path-based dispatch work for AWS
+# ALB URLs (`http://alb/api/v1/device`) and root-style URLs (GCP/Azure
+# *.run.app, *.azurecontainerapps.io) without two code paths.
+#
+# Usage:
+#   ./test_apis.sh                          # Run the full test suite
+#   ./test_apis.sh --list                   # List individual operations
+#   ./test_apis.sh --help                   # Same as --list
+#   ./test_apis.sh <op> [--flag value ...]  # Run one operation
+#
+# After `login`, the JWT is saved to /tmp/smarthome-jwt and re-used by
+# subsequent authenticated calls until you run `logout` or `logout-local`.
+#
+# Requires: bash 4+, curl, jq
 # =============================================================================
 set -u
 
-cd "$(dirname "$0")"
-
-# -- Resolve base URL ---------------------------------------------------------
-if [ -z "${BASE_URL:-}" ]; then
-  BASE_URL=$(cd terraform && terraform output -raw api_gateway_url 2>/dev/null || true)
-fi
-if [ -z "${BASE_URL:-}" ]; then
-  echo "ERROR: BASE_URL not set and 'terraform output api_gateway_url' returned nothing."
-  echo "Run terraform apply first, or pass BASE_URL=... explicitly."
+# Per-service URL dispatch uses associative arrays (bash 4+). macOS
+# still ships bash 3.2 by default — install a newer bash via
+# `brew install bash` and invoke as `/opt/homebrew/bin/bash ...`.
+if (( BASH_VERSINFO[0] < 4 )); then
+  echo "ERROR: bash 4+ required (you have $BASH_VERSION)."
+  echo "On macOS: brew install bash && /opt/homebrew/bin/bash $0"
   exit 1
 fi
-BASE_URL="${BASE_URL%/}"
 
 if ! command -v jq >/dev/null; then
-  echo "ERROR: jq is required. Install with: sudo apt install jq"
+  echo "ERROR: jq is required. Install with: sudo apt install jq (or brew install jq)"
   exit 1
 fi
+
+# -- Extract --urls-file / --platform (may appear anywhere on the cmd line) ---
+URLS_FILE="${SERVICE_URLS_FILE:-}"
+PLATFORM="${SERVICE_URLS_PLATFORM:-}"
+REMAINING_ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --urls-file)   URLS_FILE="$2"; shift 2 ;;
+    --urls-file=*) URLS_FILE="${1#*=}"; shift ;;
+    --platform)    PLATFORM="$2"; shift 2 ;;
+    --platform=*)  PLATFORM="${1#*=}"; shift ;;
+    *) REMAINING_ARGS+=("$1"); shift ;;
+  esac
+done
+set -- "${REMAINING_ARGS[@]+"${REMAINING_ARGS[@]}"}"
+
+# -- Resolve per-service URLs -------------------------------------------------
+# Priority: SERVICE_URLS_JSON > --urls-file > --platform > cwd's terraform/.
+if [ -z "${SERVICE_URLS_JSON:-}" ] && [ -n "$URLS_FILE" ]; then
+  if [ ! -f "$URLS_FILE" ]; then
+    echo "ERROR: urls file not found: $URLS_FILE" >&2
+    exit 1
+  fi
+  # Parse the HCL-ish format Terraform emits for a map(string) output:
+  #   "key" = "value"
+  # one entry per line, possibly indented, ignoring the outer braces.
+  SERVICE_URLS_JSON=$(
+    grep -E '^[[:space:]]*"[^"]+"[[:space:]]*=[[:space:]]*"[^"]*"' "$URLS_FILE" \
+    | sed -E 's/^[[:space:]]*"([^"]+)"[[:space:]]*=[[:space:]]*"([^"]*)".*$/\1=\2/' \
+    | jq -Rn '[inputs | split("=") | {key: .[0], value: (.[1:] | join("="))}] | from_entries'
+  )
+fi
+
+if [ -z "${SERVICE_URLS_JSON:-}" ] && [ -n "$PLATFORM" ]; then
+  case "$PLATFORM" in
+    aws|gcp|azure) ;;
+    *) echo "ERROR: --platform must be one of: aws gcp azure (got '$PLATFORM')" >&2; exit 1 ;;
+  esac
+  # Resolve relative to the script's own dir so the user can invoke it
+  # from anywhere ($PWD-independent).
+  SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+  TF_DIR="$SCRIPT_DIR/$PLATFORM/terraform"
+  if [ ! -d "$TF_DIR" ]; then
+    echo "ERROR: terraform dir not found: $TF_DIR" >&2
+    exit 1
+  fi
+  SERVICE_URLS_JSON=$(cd "$TF_DIR" && terraform output -json service_urls 2>/dev/null || echo "")
+fi
+
+if [ -z "${SERVICE_URLS_JSON:-}" ]; then
+  # Last-resort fallback: if there's a terraform/ subdir of cwd, try its output.
+  if [ -d ./terraform ]; then
+    SERVICE_URLS_JSON=$(cd terraform && terraform output -json service_urls 2>/dev/null || echo "")
+  fi
+fi
+
+if [ -z "${SERVICE_URLS_JSON:-}" ] || [ "$SERVICE_URLS_JSON" = "{}" ]; then
+  echo "ERROR: no service URLs resolved." >&2
+  echo "Try one of:" >&2
+  echo "  ./test_apis.sh --platform aws|gcp|azure" >&2
+  echo "  ./test_apis.sh --urls-file ./urls.txt" >&2
+  echo "  SERVICE_URLS_FILE=./urls.txt ./test_apis.sh" >&2
+  echo "  SERVICE_URLS_JSON='{\"device-service\":\"https://...\",...}' ./test_apis.sh" >&2
+  echo "  (or cd into a cloud dir that has terraform/ and run 'terraform apply' first)" >&2
+  exit 1
+fi
+
+declare -A SERVICE_URL
+while IFS=$'\t' read -r key val; do
+  # Strip trailing slash, then strip a trailing /api/v1/<anything> path so
+  # AWS ALB URLs (which bake the service prefix into the LB hostname) and
+  # GCP/Azure root URLs reduce to the same "service root" shape.
+  val="${val%/}"
+  val="${val%/api/v1/*}"
+  SERVICE_URL["$key"]="$val"
+done < <(jq -r 'to_entries[] | "\(.key)\t\(.value)"' <<<"$SERVICE_URLS_JSON")
+
+# url_for_path PATH -> echoes the matching base URL.
+# Path is expected to start with /api/v1/<service>/...; <service> maps
+# to either "<service>-service" (the four main services) or "tuya-bridge"
+# (the only odd-one-out key).
+url_for_path() {
+  local path=$1
+  local seg="${path#/api/v1/}"
+  seg="${seg%%/*}"
+  if [ -n "${SERVICE_URL[${seg}-service]:-}" ]; then
+    echo "${SERVICE_URL[${seg}-service]}"
+  elif [ -n "${SERVICE_URL[$seg]:-}" ]; then
+    echo "${SERVICE_URL[$seg]}"
+  else
+    echo "ERROR: no URL for service '${seg}' (path=${path})" >&2
+    return 1
+  fi
+}
 
 # -- Output helpers -----------------------------------------------------------
 if [ -t 1 ]; then GREEN=$'\033[32m'; RED=$'\033[31m'; DIM=$'\033[2m'; RST=$'\033[0m'
@@ -49,7 +171,9 @@ TOKEN="${TOKEN:-}"
 # call METHOD PATH [EXPECTED_STATUS] [JSON_BODY]
 call() {
   local method=$1 path=$2 expected=${3:-200} body=${4:-}
-  local url="${BASE_URL}${path}"
+  local base
+  base=$(url_for_path "$path") || { FAIL=$((FAIL+1)); return; }
+  local url="${base}${path}"
   local args=(-s -o "$RESP" -w "%{http_code}" -X "$method")
   if [ -n "$body" ]; then
     args+=(-H "Content-Type: application/json" -d "$body")
@@ -291,7 +415,7 @@ op_raw() {
 list_ops() {
   cat <<'EOF'
 Single-operation usage:
-  test_apis.sh <op> [--flag value ...]
+  test_apis.sh [--platform aws|gcp|azure | --urls-file PATH] <op> [--flag value ...]
 
 INFO
   info                          --service device|automation|user|analytics
@@ -347,14 +471,16 @@ GENERIC
   raw METHOD PATH [BODY_JSON]   # for endpoints not listed above
 
 EXAMPLES
-  test_apis.sh info --service device
-  test_apis.sh device-create --name "Living Room Bulb" --room living
-  test_apis.sh device-on --id device-7a3f2c1e
-  test_apis.sh login --email john.doe@example.com --password demo123
-  test_apis.sh me
-  test_apis.sh raw GET /api/v1/automation/templates/sunset-lights
+  test_apis.sh --platform gcp                     # full suite against GCP
+  test_apis.sh --urls-file ./aws-urls.txt         # full suite from captured file
+  test_apis.sh --platform aws info --service device
+  test_apis.sh --platform gcp device-create --name "Living Room Bulb" --room living
+  test_apis.sh --platform azure device-on --id device-7a3f2c1e
+  test_apis.sh --platform gcp login --email john.doe@example.com --password demo123
+  test_apis.sh --platform gcp me
+  test_apis.sh --platform gcp raw GET /api/v1/automation/templates/sunset-lights
 
-With no arguments, runs the full test suite (--list to see this help).
+With no operation, runs the full test suite (--list to see this help).
 EOF
 }
 
@@ -362,7 +488,10 @@ EOF
 # Full test suite (no-arg mode)
 # =============================================================================
 run_all() {
-  echo "Base URL: $BASE_URL"
+  echo "Service URLs (normalized):"
+  for key in "${!SERVICE_URL[@]}"; do
+    printf "  %-20s %s\n" "$key" "${SERVICE_URL[$key]}"
+  done
 
   section "Health & info"
   call GET /api/v1/device/info
@@ -408,6 +537,27 @@ run_all() {
     '{"name":"ad-hoc","trigger_type":"manual","trigger_config":{},"actions":[{"type":"notify","message":"hi"}]}'
   local rid2=$(jq -r '.id // empty' < "$RESP")
   [ -n "$rid2" ] && call DELETE "/api/v1/automation/rules/$rid2"
+
+  # /automation/chase — validation paths + a 1-bulb single-cycle smoke.
+  # The smoke device has no tuya_device_id, so device-service short-
+  # circuits to a noop after persisting state. That exercises the full
+  # chase loop without depending on real hardware being attached.
+  call POST /api/v1/automation/chase 400 '{"device_ids":[]}'
+  call POST /api/v1/automation/chase 400 \
+    '{"device_ids":["x"],"min_brightness":100,"max_brightness":100}'
+  # 10 * 6 * 5000 = 300_000ms, just over the 270_000ms cap. Must
+  # actually exceed the cap or this stalls the test suite for the full
+  # projected duration before failing.
+  call POST /api/v1/automation/chase 400 \
+    '{"device_ids":["a","b","c","d","e","f"],"cycles":10,"step_ms":5000}'
+  call POST /api/v1/device/devices 201 \
+    '{"name":"Chase Smoke","device_type_id":"tuya-smart-bulb","room":"test"}'
+  local chase_did=$(jq -r '.id // empty' < "$RESP")
+  if [ -n "$chase_did" ]; then
+    call POST /api/v1/automation/chase 200 \
+      "{\"device_ids\":[\"$chase_did\"],\"cycles\":1,\"step_ms\":100}"
+    call DELETE "/api/v1/device/devices/$chase_did"
+  fi
 
   section "user-service"
   TOKEN=""

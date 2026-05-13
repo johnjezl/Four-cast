@@ -353,7 +353,7 @@ Take-away: Global LB is the right answer for a *production*, multi-region deploy
 
 Coming up:
 - `terraform output service_urls` — show the deployed stack
-- `./gcp/test_apis.sh` — the 44-test sweep, runs in seconds
+- `./test_apis.sh --platform gcp` — the 44-test sweep, runs in seconds
 - Direct device control via `curl` against the real `*.run.app` URL
 - Lights actually turning on and off in the room
 

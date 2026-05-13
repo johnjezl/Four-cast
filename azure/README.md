@@ -114,11 +114,12 @@ terraform apply
   `tuya-credentials` Key Vault secret. tuya-bridge reads at container
   start, so a rollout requires forcing a new tuya-bridge revision
   (printed at the end of the script).
-- `./azure/test_apis.sh` — same flag/operation surface as the AWS
-  and GCP versions; resolves per-service URLs from
-  `terraform output -json service_urls` and routes each call to the
-  matching `*.azurecontainerapps.io` based on the `/api/v1/<service>/`
-  path segment.
+- `./test_apis.sh --platform azure` — repo-root unified test script; resolves
+  per-service URLs from `azure/terraform/`'s `terraform output -json
+  service_urls` and routes each call to the matching
+  `*.azurecontainerapps.io` based on the `/api/v1/<service>/` path segment.
+  Also works against AWS and GCP via `--platform aws` / `--platform gcp`, or
+  against a captured URL snapshot via `--urls-file PATH`.
 
 ## Cost note
 
@@ -134,9 +135,9 @@ modest. `terraform destroy` between demos is cheaper still.
 On the machine running `terraform apply` and the ops scripts:
 
 - `terraform` ≥ 1.0, `docker`, `az` (Azure CLI), `curl`, `jq`
-- `bash` ≥ 4 (for `azure/test_apis.sh`'s per-service URL dispatch).
+- `bash` ≥ 4 (for `test_apis.sh`'s per-service URL dispatch).
   macOS still ships 3.2 — install via `brew install bash` and invoke
-  the script as `/opt/homebrew/bin/bash ./azure/test_apis.sh`.
+  the script as `/opt/homebrew/bin/bash ./test_apis.sh --platform azure`.
 - `az` authenticated to your account with subscription access:
   ```bash
   az login

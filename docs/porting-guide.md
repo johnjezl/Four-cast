@@ -72,12 +72,14 @@ plumbing.
    the Python deps (`boto3` or `google-cloud-*` → `azure-servicebus` +
    `azure-keyvault-secrets` + `azure-identity`).
 
-6. **Port the ops scripts** (`push_images.sh`, `redeploy.sh`,
-   `set_tuya_secrets.sh`, `test_apis.sh`) — same shape as the GCP
-   versions, swap `gcloud` for `az`. `test_apis.sh`'s per-service URL
-   dispatch logic (and its **bash 4+** requirement — the bash-version
-   check at the top of the script) carries over unchanged; just read
-   from `terraform output -json service_urls`.
+6. **Port the cloud-specific ops scripts** (`push_images.sh`,
+   `redeploy.sh`, `set_tuya_secrets.sh`) — same shape as the GCP
+   versions, swap `gcloud` for `az`. `test_apis.sh` is **not** per-cloud
+   — there's one unified `./test_apis.sh` at the repo root that already
+   handles all three platforms via `--platform aws|gcp|azure`. Adding a
+   new cloud just means adding a new case branch in the URL-resolution
+   block, which reads from `<platform>/terraform/`'s
+   `terraform output -json service_urls`.
 
 7. **Real apply** on an Azure subscription. Iterate on whatever breaks.
 
@@ -196,8 +198,8 @@ plumbing.
 
 ## Verifying the port
 
-Once Azure is provisioned, the same `test_apis.sh` should pass
-against the new per-service URLs. If it does, the port is done
+Once Azure is provisioned, `./test_apis.sh --platform azure` should
+pass against the new per-service URLs. If it does, the port is done
 end-to-end. If a specific service fails, it's almost always one of:
 
 - adapter wired wrong (`CLOUD_PROVIDER` env var, or the protocol

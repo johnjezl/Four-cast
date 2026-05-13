@@ -114,10 +114,12 @@ terraform apply
   Secret Manager secret. Cloud Run reads at container start, so a
   rollout requires forcing a new `tuya-bridge` revision (printed at the
   end of the script).
-- `./gcp/test_apis.sh` — same flag/operation surface as the AWS
-  version; resolves per-service URLs from
-  `terraform output -json service_urls` and routes each call to the
-  matching `*.run.app` based on the `/api/v1/<service>/` path segment.
+- `./test_apis.sh --platform gcp` — repo-root unified test script; resolves
+  per-service URLs from `gcp/terraform/`'s `terraform output -json
+  service_urls` and routes each call to the matching `*.run.app` based on
+  the `/api/v1/<service>/` path segment. Also works against AWS and Azure
+  via `--platform aws` / `--platform azure`, or against a captured URL
+  snapshot via `--urls-file PATH`.
 
 ## Cost note
 
@@ -133,9 +135,9 @@ in `terraform.tfvars` if you don't need the load-balancer demo, and
 On the machine running `terraform apply` and the ops scripts:
 
 - `terraform` ≥ 1.0, `docker`, `gcloud`, `curl`, `jq`
-- `bash` ≥ 4 (for `gcp/test_apis.sh`'s per-service URL dispatch).
+- `bash` ≥ 4 (for `test_apis.sh`'s per-service URL dispatch).
   macOS still ships 3.2 — install via `brew install bash` and invoke
-  the script as `/opt/homebrew/bin/bash ./gcp/test_apis.sh`.
+  the script as `/opt/homebrew/bin/bash ./test_apis.sh --platform gcp`.
 - gcloud authenticated to your account with project access:
   ```bash
   gcloud auth login
