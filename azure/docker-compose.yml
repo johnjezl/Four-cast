@@ -1,0 +1,186 @@
+# =============================================================================
+# Smart Home Hub Platform - Azure local development
+# =============================================================================
+# Run from the repo root:
+#   docker compose -f azure/docker-compose.yml up -d
+#
+# Services:
+#   - Device Service:     http://localhost:8001
+#   - Automation Service: http://localhost:8002
+#   - User Service:       http://localhost:8003
+#   - Analytics Service:  http://localhost:8004
+#   - Tuya Bridge:        http://localhost:8005
+#   - Swagger UI:         http://localhost:8080
+#   - Adminer (DB UI):    http://localhost:8081
+#
+# `CLOUD_PROVIDER=azure` selects the Service Bus / Key Vault adapter.
+# Behavior with the Azure env vars left blank, as configured here:
+#   - Service Bus: publish / receive / ack become quiet no-ops (the
+#     adapter returns a None client when namespace is empty). DB-only
+#     endpoints work fully.
+#   - Key Vault: short-name secret lookups raise RuntimeError. This
+#     mainly affects tuya-bridge, which loads `tuya-credentials` on its
+#     poll loop — expect those polls to log errors. The other four
+#     services don't read Key Vault at runtime, so they're unaffected.
+# Each service Dockerfile expects the build context = repo root so it
+# can COPY shared/, hence the explicit `context: ..` per service.
+# =============================================================================
+
+version: "3.8"
+
+services:
+  # ===========================================================================
+  # Database
+  # ===========================================================================
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: smarthome
+      POSTGRES_PASSWORD: localdev123
+      POSTGRES_DB: smarthome
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smarthome"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================================
+  # Microservices
+  # ===========================================================================
+  device-service:
+    build:
+      context: ..
+      dockerfile: azure/services/device-service/Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      - CLOUD_PROVIDER=azure
+      - DATABASE_URL=postgresql+asyncpg://smarthome:localdev123@postgres:5432/smarthome
+      - JWT_SECRET=localdev-jwt-secret-do-not-use-in-prod
+      - INTERNAL_TOKEN=localdev-internal-token
+      - SERVICE_NAME=device-service
+      - PORT=8001
+      - LOG_LEVEL=DEBUG
+      - ENVIRONMENT=local
+      - TUYA_BRIDGE_URL=http://tuya-bridge:8005
+      - AZURE_KEY_VAULT_URL=
+      - AZURE_SERVICEBUS_FULLY_QUALIFIED_NAMESPACE=
+      - SERVICEBUS_QUEUE=
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  automation-service:
+    build:
+      context: ..
+      dockerfile: azure/services/automation-service/Dockerfile
+    ports:
+      - "8002:8002"
+    environment:
+      - CLOUD_PROVIDER=azure
+      - DATABASE_URL=postgresql+asyncpg://smarthome:localdev123@postgres:5432/smarthome
+      - JWT_SECRET=localdev-jwt-secret-do-not-use-in-prod
+      - INTERNAL_TOKEN=localdev-internal-token
+      - SERVICE_NAME=automation-service
+      - PORT=8002
+      - LOG_LEVEL=DEBUG
+      - ENVIRONMENT=local
+      - AZURE_KEY_VAULT_URL=
+      - AZURE_SERVICEBUS_FULLY_QUALIFIED_NAMESPACE=
+      - SERVICEBUS_QUEUE=
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  user-service:
+    build:
+      context: ..
+      dockerfile: azure/services/user-service/Dockerfile
+    ports:
+      - "8003:8003"
+    environment:
+      - CLOUD_PROVIDER=azure
+      - DATABASE_URL=postgresql+asyncpg://smarthome:localdev123@postgres:5432/smarthome
+      - JWT_SECRET=localdev-jwt-secret-do-not-use-in-prod
+      - INTERNAL_TOKEN=localdev-internal-token
+      - SERVICE_NAME=user-service
+      - PORT=8003
+      - LOG_LEVEL=DEBUG
+      - ENVIRONMENT=local
+      - AZURE_KEY_VAULT_URL=
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  analytics-service:
+    build:
+      context: ..
+      dockerfile: azure/services/analytics-service/Dockerfile
+    ports:
+      - "8004:8004"
+    environment:
+      - CLOUD_PROVIDER=azure
+      - DATABASE_URL=postgresql+asyncpg://smarthome:localdev123@postgres:5432/smarthome
+      - JWT_SECRET=localdev-jwt-secret-do-not-use-in-prod
+      - INTERNAL_TOKEN=localdev-internal-token
+      - SERVICE_NAME=analytics-service
+      - PORT=8004
+      - LOG_LEVEL=DEBUG
+      - ENVIRONMENT=local
+      - DEVICE_SERVICE_URL=http://device-service:8001
+      - AZURE_KEY_VAULT_URL=
+      - AZURE_SERVICEBUS_FULLY_QUALIFIED_NAMESPACE=
+      - SERVICEBUS_QUEUE=
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  tuya-bridge:
+    build:
+      context: ..
+      dockerfile: azure/services/tuya-bridge/Dockerfile
+    ports:
+      - "8005:8005"
+    environment:
+      - CLOUD_PROVIDER=azure
+      - JWT_SECRET=localdev-jwt-secret-do-not-use-in-prod
+      - INTERNAL_TOKEN=localdev-internal-token
+      - SERVICE_NAME=tuya-bridge
+      - PORT=8005
+      - LOG_LEVEL=DEBUG
+      - ENVIRONMENT=local
+      - DEVICE_SERVICE_URL=http://device-service:8001
+      - SECRET_NAME=tuya-credentials
+      - AZURE_KEY_VAULT_URL=
+    depends_on:
+      - device-service
+
+  # ===========================================================================
+  # Development Tools
+  # ===========================================================================
+  swagger-ui:
+    image: swaggerapi/swagger-ui
+    ports:
+      - "8080:8080"
+    environment:
+      - URLS=[
+          {"url":"http://localhost:8001/openapi.json","name":"Device Service"},
+          {"url":"http://localhost:8002/openapi.json","name":"Automation Service"},
+          {"url":"http://localhost:8003/openapi.json","name":"User Service"},
+          {"url":"http://localhost:8004/openapi.json","name":"Analytics Service"},
+          {"url":"http://localhost:8005/openapi.json","name":"Tuya Bridge"}
+        ]
+
+  adminer:
+    image: adminer
+    ports:
+      - "8081:8080"
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:

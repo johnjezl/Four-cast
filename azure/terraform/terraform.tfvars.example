@@ -1,0 +1,31 @@
+# =============================================================================
+# Smart Home Hub Platform - Azure Terraform Configuration
+# =============================================================================
+# Copy this file to terraform.tfvars and fill in your values.
+
+# Azure Configuration
+azure_subscription_id = "00000000-0000-0000-0000-000000000000"
+azure_location        = "eastus"
+environment           = "dev"
+
+# Database (use a strong password in production!)
+db_username = "smarthome_admin"
+db_password = "CHANGE_ME_STRONG_PASSWORD"
+
+# =============================================================================
+# Tuya Integration
+# =============================================================================
+# Get these from: https://iot.tuya.com -> Cloud -> Development -> Your Project
+# Leave blank if not integrating with Tuya. Services will still deploy,
+# tuya-bridge will just fail when called.
+tuya_client_id     = ""
+tuya_client_secret = ""
+tuya_region        = "us" # us, eu, cn, in
+tuya_device_ids    = ""
+
+# =============================================================================
+# Container Apps sizing
+# =============================================================================
+min_instances = 0
+max_instances = 4
+log_level     = "INFO"

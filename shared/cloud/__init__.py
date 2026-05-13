@@ -3,8 +3,9 @@
 # =============================================================================
 # event_bus() and secret_store() pick the right adapter based on the
 # CLOUD_PROVIDER env var. The adapter modules are lazy-imported so an
-# AWS container doesn't need google-cloud-* installed and vice versa —
-# importing this package costs nothing until you call a factory.
+# AWS container doesn't need google-cloud-* or azure-* installed and
+# vice versa. Importing this package costs nothing until you call a
+# factory.
 # =============================================================================
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ def _provider() -> str:
     value = os.environ.get("CLOUD_PROVIDER")
     if not value:
         raise RuntimeError(
-            "CLOUD_PROVIDER environment variable must be set to 'aws' or 'gcp'."
+            "CLOUD_PROVIDER environment variable must be set to 'aws', 'gcp', or 'azure'."
         )
     return value.strip().lower()
 
@@ -33,6 +34,10 @@ def event_bus() -> EventBus:
         from . import gcp
 
         return gcp.PubSubEventBus()
+    if provider == "azure":
+        from . import azure
+
+        return azure.ServiceBusEventBus()
     raise RuntimeError(f"Unknown CLOUD_PROVIDER: {provider!r}")
 
 
@@ -46,6 +51,10 @@ def secret_store() -> SecretStore:
         from . import gcp
 
         return gcp.SecretManagerStore()
+    if provider == "azure":
+        from . import azure
+
+        return azure.KeyVaultSecretStore()
     raise RuntimeError(f"Unknown CLOUD_PROVIDER: {provider!r}")
 
 
