@@ -449,6 +449,27 @@ run_all() {
   local rid2=$(jq -r '.id // empty' < "$RESP")
   [ -n "$rid2" ] && call DELETE "/api/v1/automation/rules/$rid2"
 
+  # /automation/chase — validation paths + a 1-bulb single-cycle smoke.
+  # The smoke device has no tuya_device_id, so device-service short-
+  # circuits to a noop after persisting state. That exercises the full
+  # chase loop without depending on real hardware being attached.
+  call POST /api/v1/automation/chase 400 '{"device_ids":[]}'
+  call POST /api/v1/automation/chase 400 \
+    '{"device_ids":["x"],"min_brightness":100,"max_brightness":100}'
+  # 10 * 6 * 5000 = 300_000ms, just over the 270_000ms cap. Must
+  # actually exceed the cap or this stalls the test suite for the full
+  # projected duration before failing.
+  call POST /api/v1/automation/chase 400 \
+    '{"device_ids":["a","b","c","d","e","f"],"cycles":10,"step_ms":5000}'
+  call POST /api/v1/device/devices 201 \
+    '{"name":"Chase Smoke","device_type_id":"tuya-smart-bulb","room":"test"}'
+  local chase_did=$(jq -r '.id // empty' < "$RESP")
+  if [ -n "$chase_did" ]; then
+    call POST /api/v1/automation/chase 200 \
+      "{\"device_ids\":[\"$chase_did\"],\"cycles\":1,\"step_ms\":100}"
+    call DELETE "/api/v1/device/devices/$chase_did"
+  fi
+
   section "user-service"
   TOKEN=""
   call POST /api/v1/user/login 200 '{"email":"john.doe@example.com","password":"demo123"}'

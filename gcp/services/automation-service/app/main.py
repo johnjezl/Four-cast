@@ -7,7 +7,9 @@ Storage: Postgres for rules and execution logs. Templates are immutable seed dat
 kept in-memory.
 """
 
+import asyncio
 import os
+import time
 import uuid
 import socket
 import logging
@@ -16,6 +18,7 @@ from typing import Optional
 from contextlib import asynccontextmanager
 from enum import Enum
 
+import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field as PydanticField
@@ -28,6 +31,10 @@ from .db import async_session, engine, get_session, init_db
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger(__name__)
+
+DEVICE_SERVICE_URL = os.environ.get("DEVICE_SERVICE_URL", "").rstrip("/")
+INTERNAL_TOKEN = os.environ.get("INTERNAL_TOKEN", "")
+http_client: Optional[httpx.AsyncClient] = None
 
 
 # =============================================================================
@@ -189,9 +196,12 @@ async def execute_rule(rule_id: str, trigger_event: dict) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global http_client
     logger.info("Automation Service starting...")
     await init_db()
+    http_client = httpx.AsyncClient(timeout=5.0)
     yield
+    await http_client.aclose()
     await engine.dispose()
     logger.info("Automation Service shutting down...")
 
@@ -375,6 +385,144 @@ async def get_execution_history(
     stmt = select(ExecutionLog).order_by(desc(ExecutionLog.triggered_at)).limit(limit)
     logs = (await session.execute(stmt)).scalars().all()
     return {"executions": logs}
+
+
+# =============================================================================
+# Demo: chase animation
+# =============================================================================
+# Demo endpoint that animates a brightness "rotating spotlight" across N
+# bulbs by calling device-service's /brightness endpoint in a step loop.
+# Bypasses the rule infrastructure because the rule executor (see
+# trigger_rule_manually below) is currently a no-op — wiring rule
+# actions to actually dispatch commands is a larger separate concern.
+# Latency note: device-service forwards each call synchronously to
+# tuya-bridge, so each step lands in ~500ms. The 60s tuya-bridge poll
+# loop is irrelevant here — it's a separate reconciliation path.
+
+# Cap total chase duration well under Cloud Run's 300s request
+# timeout so the request can't be killed mid-animation, leaving
+# bulbs in whatever frame they last received.
+MAX_CHASE_DURATION_MS = 270_000
+
+
+class ChaseRequest(BaseModel):
+    device_ids: list[str]
+    cycles: int = PydanticField(default=3, ge=1, le=20)
+    step_ms: int = PydanticField(default=500, ge=100, le=5000)
+    min_brightness: int = PydanticField(default=10, ge=0, le=100)
+    max_brightness: int = PydanticField(default=100, ge=0, le=100)
+
+
+async def _device_post(device_id: str, path_suffix: str, params: Optional[dict] = None) -> Optional[str]:
+    """Generic POST to a device-service endpoint. Returns None on success
+    or an error string on failure."""
+    if not DEVICE_SERVICE_URL or http_client is None:
+        return "DEVICE_SERVICE_URL not configured"
+    try:
+        r = await http_client.post(
+            f"{DEVICE_SERVICE_URL}/api/v1/device/devices/{device_id}/{path_suffix}",
+            params=params,
+            headers={"X-Internal-Token": INTERNAL_TOKEN} if INTERNAL_TOKEN else {},
+        )
+        if r.status_code >= 400:
+            return f"{device_id}: HTTP {r.status_code} {r.text[:120]}"
+        return None
+    except Exception as e:
+        return f"{device_id}: {type(e).__name__}: {e}"
+
+
+async def _set_power(device_id: str, on: bool) -> Optional[str]:
+    return await _device_post(device_id, "on" if on else "off")
+
+
+async def _set_brightness(device_id: str, level: int) -> Optional[str]:
+    return await _device_post(device_id, "brightness", params={"level": level})
+
+
+@app.post("/api/v1/automation/chase", tags=["Demo"])
+async def run_chase(req: ChaseRequest):
+    """Animate a rotating-spotlight chase across N bulbs.
+
+    Ensures bulbs are on, normalizes them to `min_brightness`, then
+    rotates the spotlight one slot per step for `cycles` full
+    revolutions. Errors per command are collected and returned; a
+    single failing bulb does not abort the chase.
+    """
+    if not DEVICE_SERVICE_URL or http_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="DEVICE_SERVICE_URL not configured; chase cannot dispatch commands",
+        )
+    if not req.device_ids:
+        raise HTTPException(status_code=400, detail="device_ids must be non-empty")
+    if req.max_brightness <= req.min_brightness:
+        raise HTTPException(
+            status_code=400,
+            detail="max_brightness must be greater than min_brightness",
+        )
+
+    n = len(req.device_ids)
+    # Projection covers every step_ms sleep the handler will actually
+    # do: `cycles * n` rotation-frame sleeps plus the one settling sleep
+    # after the pre-zero frame. HTTP round-trip time during prefire and
+    # per frame is variable and ignored here; the 30s cushion between
+    # this cap and Cloud Run's 300s request timeout absorbs it.
+    projected_ms = (req.cycles * n + 1) * req.step_ms
+    if projected_ms > MAX_CHASE_DURATION_MS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"chase would run for {projected_ms}ms, exceeding the "
+                f"{MAX_CHASE_DURATION_MS}ms cap. Lower cycles, step_ms, "
+                f"or device_ids."
+            ),
+        )
+
+    started = time.monotonic()
+    steps = 0
+    errors: list[str] = []
+
+    async def _gather(coros, label: Optional[str] = None) -> None:
+        for result in await asyncio.gather(*coros):
+            if result is not None:
+                errors.append(f"{label}: {result}" if label else result)
+
+    # Normalize starting state so frame 1 is a clean snap regardless of
+    # what brightness the bulbs were at: first ensure power, then bring
+    # everyone down to min_brightness. Errors from each phase are
+    # labeled so callers can distinguish setup failures from rotation
+    # failures.
+    await _gather([_set_power(d, True) for d in req.device_ids], label="prefire-on")
+    await _gather(
+        [_set_brightness(d, req.min_brightness) for d in req.device_ids],
+        label="prezero",
+    )
+    await asyncio.sleep(req.step_ms / 1000)
+
+    # Rotating spotlight: at each step, one bulb is at max, the rest at
+    # min. Position advances one slot per step. Commands within a step
+    # are issued in parallel so the visible "snap" between frames is
+    # close to simultaneous.
+    for _ in range(req.cycles):
+        for position in range(n):
+            await _gather(
+                [
+                    _set_brightness(
+                        device_id,
+                        req.max_brightness if i == position else req.min_brightness,
+                    )
+                    for i, device_id in enumerate(req.device_ids)
+                ]
+            )
+            steps += 1
+            await asyncio.sleep(req.step_ms / 1000)
+
+    return {
+        "status": "completed",
+        "steps_executed": steps,
+        "duration_ms": int((time.monotonic() - started) * 1000),
+        "errors": errors,
+    }
 
 
 if __name__ == "__main__":

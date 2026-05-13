@@ -227,10 +227,12 @@ resource "google_cloud_run_v2_service" "main" {
       # PORT is injected by Cloud Run from ports.container_port — it's
       # reserved and rejected if set explicitly.
 
-      # analytics-service queries device-service for live counts.
-      # Cross-resource reference to the split device_service is acyclic.
+      # analytics-service queries device-service for live counts;
+      # automation-service issues device commands as part of rule
+      # execution (e.g., the /chase demo endpoint). Cross-resource
+      # reference to the split device_service is acyclic.
       dynamic "env" {
-        for_each = each.key == "analytics-service" ? [google_cloud_run_v2_service.device_service.uri] : []
+        for_each = contains(["analytics-service", "automation-service"], each.key) ? [google_cloud_run_v2_service.device_service.uri] : []
         content {
           name  = "DEVICE_SERVICE_URL"
           value = env.value
