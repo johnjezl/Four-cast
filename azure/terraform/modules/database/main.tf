@@ -95,6 +95,10 @@ resource "azurerm_postgresql_flexible_server_configuration" "tcp_keepalives_coun
 #
 # `triggers` captures the server identity at create time so it's still
 # available during destroy when the resource is being removed.
+#
+# Note: `az postgres flexible-server restart` doesn't accept `--yes` (no
+# confirmation prompt to suppress). Don't add one — it errors with
+# `unrecognized arguments: --yes` and halts the destroy mid-flight.
 resource "null_resource" "terminate_db_connections" {
   triggers = {
     server_name         = azurerm_postgresql_flexible_server.main.name
@@ -114,7 +118,7 @@ resource "null_resource" "terminate_db_connections" {
 
   provisioner "local-exec" {
     when    = destroy
-    command = "az postgres flexible-server restart --name ${self.triggers.server_name} --resource-group ${self.triggers.resource_group_name} --yes"
+    command = "az postgres flexible-server restart --name ${self.triggers.server_name} --resource-group ${self.triggers.resource_group_name}"
   }
 }
 
