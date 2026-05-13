@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field as PydanticField
 from sqlalchemy import BigInteger, Column, DateTime, Float, ForeignKey, Index, Integer, cast, text
 from sqlalchemy import update as sa_update
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import Field, SQLModel, select
 
@@ -242,6 +242,15 @@ class CommandRequest(BaseModel):
 class ReportedStateUpdate(BaseModel):
     tuya_device_id: str
     reported: dict
+
+
+class TelemetryPayload(BaseModel):
+    """Body shape for POST /protocol/v1/telemetry. `readings` maps
+    capability name to its (numeric) value. `recorded_at` is the
+    device-supplied timestamp; absent → NULL in the row (and the
+    bus event falls back to received_at, in PR5)."""
+    readings: dict[str, Any]
+    recorded_at: Optional[datetime] = None
 
 
 class DeviceKeyCreate(BaseModel):
@@ -1281,6 +1290,91 @@ async def claim_pending_devices(
         })
 
     return {"pending": claimed}
+
+
+# =============================================================================
+# Direct-device protocol — telemetry receive
+# =============================================================================
+# Devices that don't go through a vendor cloud (Shelly H&T being the
+# first) post readings here on each wake-up. Auth is the per-device
+# X-Device-Key from PR2; the write_telemetry scope is required (Shelly
+# keys are issued with this scope; bulb-style polling keys are not).
+#
+# Production deployment relies on the LB / Cloud Run terminating HTTPS
+# in front of this service. Application-level enforcement of
+# `x-forwarded-proto: https` is intentionally not added — Cloud Run
+# only accepts HTTPS, and the doc's "HTTPS is required" applies to the
+# ingress contract, not in-process inspection.
+
+
+@app.post(
+    "/api/v1/device/protocol/v1/telemetry",
+    tags=["Device Protocol"],
+    status_code=204,
+)
+async def receive_telemetry(
+    payload: TelemetryPayload,
+    key: DeviceKey = Depends(require_scope("write_telemetry")),
+    session: AsyncSession = Depends(get_session),
+):
+    """Receive a batch of telemetry readings from a direct-protocol
+    device. Validates each capability leniently (unknown / out-of-range
+    / non-numeric values are logged and dropped, not 400) so a Shelly
+    firmware update that adds a new field doesn't flap the endpoint.
+
+    Persistence uses INSERT ... ON CONFLICT DO NOTHING against the
+    partial unique index on (device_id, capability, recorded_at). When
+    the device supplies recorded_at, retried webhooks are absorbed
+    idempotently. When it doesn't, duplicates pass through and
+    consumers must be idempotent (deferred problem per the design doc).
+
+    Bus publish (one device.telemetry event) lands in PR5; this PR is
+    the persistence path only."""
+    received_at = datetime.utcnow()
+    rows = []
+    for capability, value in payload.readings.items():
+        spec = CAPABILITIES.get(capability)
+        if not spec:
+            logger.info(
+                f"telemetry: unknown capability {capability!r} from device "
+                f"{key.device_id}; dropping"
+            )
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            logger.info(
+                f"telemetry: non-numeric value for {capability} from device "
+                f"{key.device_id}; dropping"
+            )
+            continue
+        rng = spec.get("range")
+        if rng and not (rng[0] <= float(value) <= rng[1]):
+            logger.info(
+                f"telemetry: {capability}={value} out of range {rng} from "
+                f"device {key.device_id}; dropping"
+            )
+            continue
+        rows.append({
+            "device_id": key.device_id,
+            "capability": capability,
+            "value": float(value),
+            "recorded_at": payload.recorded_at,
+            "received_at": received_at,
+        })
+
+    if not rows:
+        # Everything filtered. Per the doc: skip persist + publish but
+        # still respond 204 — 400 would flap on Shelly firmware adding
+        # fields before they're registered platform-side.
+        return
+
+    stmt = pg_insert(DeviceTelemetry).values(rows).on_conflict_do_nothing(
+        index_elements=["device_id", "capability", "recorded_at"],
+        index_where=text("recorded_at IS NOT NULL"),
+    )
+    await session.execute(stmt)
+    await session.commit()
+    # PR5 will publish here, gated on whether any row was actually
+    # inserted (vs. swallowed by ON CONFLICT).
 
 
 if __name__ == "__main__":
