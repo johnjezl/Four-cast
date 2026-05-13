@@ -472,20 +472,23 @@ CAPABILITIES = {
         "enum": ["white", "colour", "scene", "music"],
         "description": "Bulb operating mode",
     },
-    # Sensor capabilities. Registered here in PR1 so the 'sensor' device
-    # type can declare them without tripping _sanity_check_device_types.
-    # The `read_only` flag and PUT /state rejection land in a later PR
-    # alongside the protocol/v1/telemetry receive endpoint.
+    # Sensor capabilities. read_only=True signals "device → platform"
+    # direction only; validate_state_keys rejects attempts to set these
+    # via PUT /state or POST /command. They're still reported via
+    # /protocol/v1/telemetry (the receive endpoint validates inline,
+    # bypassing this gate).
     "temperature": {
         "type": "float",
         "range": [-40.0, 180.0],
         "unit": "fahrenheit",
+        "read_only": True,
         "description": "Ambient temperature in Fahrenheit",
     },
     "humidity": {
         "type": "float",
         "range": [0.0, 100.0],
         "unit": "percent",
+        "read_only": True,
         "description": "Relative humidity as a percentage",
     },
 }
@@ -581,7 +584,11 @@ def validate_state_keys(state: dict, device_type: DeviceType) -> None:
     Keys must be in the type's capability list; values must match the
     type / range / enum declared in CAPABILITIES. Catches typos, leftover
     vendor codes, and malformed input at the API edge instead of letting
-    them propagate into the shadow."""
+    them propagate into the shadow.
+
+    Also rejects read-only capabilities (sensor readings) — those flow
+    inbound only via /protocol/v1/telemetry, never as a /state or
+    /command write."""
     allowed = set(device_type.capabilities)
     bad = [k for k in state.keys() if k not in allowed]
     if bad:
@@ -589,6 +596,17 @@ def validate_state_keys(state: dict, device_type: DeviceType) -> None:
             status_code=400,
             detail=f"Unknown capabilities for {device_type.id}: {bad}. "
                    f"Allowed: {sorted(allowed)}",
+        )
+    read_only_attempts = [
+        k for k in state.keys()
+        if CAPABILITIES.get(k, {}).get("read_only")
+    ]
+    if read_only_attempts:
+        raise HTTPException(
+            status_code=400,
+            detail=f"read-only capabilities cannot be set: {read_only_attempts}. "
+                   f"Sensor readings are received via "
+                   f"/api/v1/device/protocol/v1/telemetry.",
         )
     for k, v in state.items():
         _validate_value(k, v)
