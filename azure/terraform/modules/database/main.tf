@@ -91,21 +91,46 @@ resource "null_resource" "tcp_keepalives" {
     probes   = "3"
   }
 
+  # Static-parameter changes restart the Flexible Server asynchronously,
+  # and the next `az parameter set` call against a still-restarting
+  # server fails with ServerIsBusy. Wait for the server's state to
+  # return to "Ready" between calls. `az` returns from `parameter set`
+  # once the API accepts the change, NOT once the restart completes —
+  # so the explicit wait loop is required.
   provisioner "local-exec" {
     command = <<-EOT
       set -e
+      SERVER='${self.triggers.server_name}'
+      RG='${self.triggers.resource_group_name}'
+
+      wait_for_ready() {
+        for _ in $(seq 1 60); do
+          state=$(az postgres flexible-server show --name "$SERVER" --resource-group "$RG" --query state -o tsv 2>/dev/null || echo "")
+          if [ "$state" = "Ready" ]; then
+            return 0
+          fi
+          sleep 10
+        done
+        echo "ERROR: server $SERVER did not return to Ready within 10 minutes (last state: $state)" >&2
+        return 1
+      }
+
+      wait_for_ready
       az postgres flexible-server parameter set \
-        --server-name ${self.triggers.server_name} \
-        --resource-group ${self.triggers.resource_group_name} \
-        --name tcp_keepalives_idle --value ${self.triggers.idle}
+        --server-name "$SERVER" --resource-group "$RG" \
+        --name tcp_keepalives_idle --value '${self.triggers.idle}'
+
+      wait_for_ready
       az postgres flexible-server parameter set \
-        --server-name ${self.triggers.server_name} \
-        --resource-group ${self.triggers.resource_group_name} \
-        --name tcp_keepalives_interval --value ${self.triggers.interval}
+        --server-name "$SERVER" --resource-group "$RG" \
+        --name tcp_keepalives_interval --value '${self.triggers.interval}'
+
+      wait_for_ready
       az postgres flexible-server parameter set \
-        --server-name ${self.triggers.server_name} \
-        --resource-group ${self.triggers.resource_group_name} \
-        --name tcp_keepalives_count --value ${self.triggers.probes}
+        --server-name "$SERVER" --resource-group "$RG" \
+        --name tcp_keepalives_count --value '${self.triggers.probes}'
+
+      wait_for_ready
     EOT
   }
 }
