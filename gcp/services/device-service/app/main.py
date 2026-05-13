@@ -78,6 +78,12 @@ logger = logging.getLogger(__name__)
 TUYA_BRIDGE_URL = os.getenv("TUYA_BRIDGE_URL", "").rstrip("/")
 INTERNAL_TOKEN = os.getenv("INTERNAL_TOKEN", "")
 
+# Public-facing base URL used in onboarding snippets (e.g. Shelly Action
+# URLs). Overridden in production via env; the default example.com value
+# is intentionally not-routable so a missing env var fails loudly when
+# the user tries to apply the snippet.
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.smarthome.example")
+
 # Shared JWT secret with user-service. user-service issues tokens at
 # login; device-service only verifies them on read endpoints. HS256
 # matches user-service's signing algorithm.
@@ -290,13 +296,18 @@ class DeviceKeyCreate(BaseModel):
 
 class DeviceKeyIssued(BaseModel):
     """Response shape for POST /devices/{id}/keys — includes the
-    plaintext key, returned **once** at issuance."""
+    plaintext key, returned **once** at issuance. `snippets` is an
+    optional dictionary keyed by family identifier (e.g.
+    `shelly_action`); populated only when device_metadata.subtype
+    matches a known family. Future device families add new keys
+    without changing this schema."""
     id: str
     device_id: str
     key: str          # plaintext, only returned at issuance
     key_prefix: str
     scopes: list[str]
     created_at: datetime
+    snippets: dict[str, Any] = PydanticField(default_factory=dict)
 
 
 class DeviceKeyInfo(BaseModel):
@@ -1043,6 +1054,50 @@ async def delete_device(device_id: str, session: AsyncSession = Depends(get_sess
 _DEFAULT_KEY_SCOPES = ["read_pending", "write_reported"]
 
 
+def _shelly_ht_gen3_action(plaintext_key: str) -> dict:
+    """Render the Shelly Gen3 Action JSON for an H&T sensor — URL,
+    method, headers, body. The user pastes this into the device's
+    web UI (or POSTs it to the device's RPC `Webhook.Create`).
+
+    Placeholder syntax (`${temperature_F}`, `${humidity}`, `${ts}`)
+    is the doc's sketch and is **TBD pending hardware verification
+    in PR9**. The actual Gen3 RPC names may differ — when PR9 lands
+    the confirmed names will be substituted here."""
+    return {
+        "event": "sensor.report",  # placeholder — confirm in PR9
+        "method": "POST",
+        "url": f"{API_BASE_URL}/api/v1/device/protocol/v1/telemetry",
+        "headers": {
+            "X-Device-Key": plaintext_key,
+            "Content-Type": "application/json",
+        },
+        "body": {
+            "readings": {
+                "temperature": "${temperature_F}",
+                "humidity": "${humidity}",
+            },
+            "recorded_at": "${ts}",
+        },
+        "_note": (
+            "Placeholders (${temperature_F}, ${humidity}, ${ts}) are "
+            "the design doc's sketch — Shelly Gen3 RPC variable "
+            "names may differ. Verify against firmware before "
+            "applying to a production device."
+        ),
+    }
+
+
+def _build_onboarding_snippets(device: Device, plaintext_key: str) -> dict[str, Any]:
+    """Produce family-specific onboarding snippets based on
+    device_metadata.subtype. Empty dict if no family matches —
+    keys-only response stays valid for generic direct devices."""
+    subtype = (device.device_metadata or {}).get("subtype")
+    snippets: dict[str, Any] = {}
+    if subtype == "shelly_ht_gen3":
+        snippets["shelly_action"] = _shelly_ht_gen3_action(plaintext_key)
+    return snippets
+
+
 @app.post(
     "/api/v1/device/devices/{device_id}/keys",
     tags=["Device Keys"],
@@ -1078,6 +1133,7 @@ async def issue_device_key(
         key_prefix=row.key_prefix,
         scopes=row.scopes,
         created_at=row.created_at,
+        snippets=_build_onboarding_snippets(device, plaintext),
     )
 
 
