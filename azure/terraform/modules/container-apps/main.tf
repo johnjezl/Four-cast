@@ -228,8 +228,12 @@ resource "azurerm_container_app" "main" {
         value = azurerm_user_assigned_identity.services[each.key].client_id
       }
 
+      # analytics-service queries device-service for live counts;
+      # automation-service issues device commands as part of rule
+      # execution (e.g., the /chase demo endpoint). Same shape as the
+      # equivalent dynamic block in gcp/terraform/modules/cloud-run/main.tf.
       dynamic "env" {
-        for_each = each.key == "analytics-service" ? ["https://${azurerm_container_app.device_service.ingress[0].fqdn}"] : []
+        for_each = contains(["analytics-service", "automation-service"], each.key) ? ["https://${azurerm_container_app.device_service.ingress[0].fqdn}"] : []
         content {
           name  = "DEVICE_SERVICE_URL"
           value = env.value
