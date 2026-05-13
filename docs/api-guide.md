@@ -108,6 +108,8 @@ The platform speaks a canonical capability vocabulary. Vendor-specific datapoint
 | `color` | object | `{ h: 0–360, s: 0–100, v: 0–100 }` | HSV |
 | `color_temp` | int | 0–100 | 0 = warmest, 100 = coolest |
 | `mode` | string | `white \| colour \| scene \| music` | Bulb operating mode |
+| `temperature` | float | -40.0–180.0 (°F) | **Read-only.** Sensor reading; received via `/protocol/v1/telemetry`. Cannot be set via `/state` or `/command`. |
+| `humidity` | float | 0.0–100.0 (%) | **Read-only.** Sensor reading; same path as `temperature`. |
 
 Validation at the API edge:
 
@@ -159,6 +161,139 @@ GET /api/v1/device/capabilities
 ```json
 { "capability": "color", "value": { "h": 120, "s": 80, "v": 100 } }
 ```
+
+### Device protocol v1 — telemetry (Shelly H&T and future direct WiFi devices)
+
+For devices that don't go through a vendor cloud and instead push readings directly over HTTPS — currently the Shelly H&T Gen3 temperature/humidity sensor. The model is:
+
+- **Each device gets a long-lived API key**, issued once at registration time and stored only as a bcrypt hash on the server.
+- **The device authenticates** every request with `X-Device-Key: dvk_<token>`.
+- **Sensor readings are pushed**, not polled — the device wakes on a schedule, posts to `/protocol/v1/telemetry`, and goes back to sleep.
+
+#### Device keys
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/v1/device/devices/{id}/keys` | Issue a new key for a device. Plaintext is returned **once** in the `key` field. |
+| GET | `/api/v1/device/devices/{id}/keys` | List a device's keys (prefix, scopes, lifecycle timestamps — no plaintext). |
+| DELETE | `/api/v1/device/devices/{id}/keys/{key_id}` | Revoke a key (soft-delete; preserves audit trail). |
+
+**Issue body:**
+```json
+{ "scopes": ["write_telemetry"] }
+```
+
+`scopes` is optional and defaults to `["read_pending", "write_reported"]` (the polling-protocol scopes). For Shelly H&T and other telemetry-pushing sensors, pass `["write_telemetry"]` explicitly.
+
+**Issue response:**
+```json
+{
+  "id": "key-uuid",
+  "device_id": "device-...",
+  "key": "dvk_AbCd...",
+  "key_prefix": "dvk_AbCd",
+  "scopes": ["write_telemetry"],
+  "created_at": "2026-05-12T20:30:00",
+  "snippets": {
+    "shelly_action": { "url": "...", "method": "POST", "headers": {...}, "body": {...} }
+  }
+}
+```
+
+`snippets` is populated based on `device_metadata.subtype`. For a device created with `device_metadata: {"subtype": "shelly_ht_gen3"}`, the response includes a copy-paste-ready Shelly Action JSON in `snippets.shelly_action`. Other device families (none yet) would add their own keys without changing the response schema.
+
+> **Save the `key` value immediately.** It's only returned in this response — there's no way to retrieve it later. If you lose it, revoke the key and issue a new one.
+
+#### Push telemetry (device → platform)
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/v1/device/protocol/v1/telemetry` | Receive a batch of sensor readings. Auth: `X-Device-Key` with `write_telemetry` scope. |
+
+**Body:**
+```json
+{
+  "readings": { "temperature": 71.6, "humidity": 44.2 },
+  "recorded_at": "2026-05-12T20:30:00Z"
+}
+```
+
+`recorded_at` is optional. When supplied, the platform uses it for idempotent dedup of retried webhooks — sending the same `(device, capability, recorded_at)` tuple twice is a no-op.
+
+**Responses:** `204 No Content` on success (whether one or more readings were accepted, or all were filtered as unknown/out-of-range). Validation is lenient — unknown capabilities and out-of-range values are logged and dropped, not rejected with 400, so Shelly firmware updates that add new fields don't flap the endpoint.
+
+| Status | Reason |
+|---|---|
+| `204` | One or more readings accepted, or every reading filtered (still 204 — no client signal needed) |
+| `400` | Body malformed JSON / fails the schema |
+| `401` | `X-Device-Key` missing, malformed, unknown, or revoked |
+| `403` | Key valid but lacks `write_telemetry` scope |
+
+#### Read telemetry 🔒 (platform → user)
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/v1/device/devices/{id}/telemetry` | Time-ordered, paginated readings for a device. |
+
+Query parameters:
+
+| Param | Default | Description |
+|---|---|---|
+| `since` | `now - 24h` | Lower bound on `received_at` (ISO8601) |
+| `capability` | — | Optional filter to a single capability (`temperature` or `humidity`) |
+| `limit` | `1000` (max `10000`) | Page size |
+| `cursor` | — | Opaque pagination cursor returned by a prior page |
+
+**Response:**
+```json
+{
+  "device_id": "device-...",
+  "readings": [
+    { "capability": "temperature", "value": 71.6, "recorded_at": "...", "received_at": "..." },
+    { "capability": "humidity", "value": 44.2, "recorded_at": null, "received_at": "..." }
+  ],
+  "next_cursor": "MjAyNi0wNS0xMlQyMDozMDowMHwxNDI"
+}
+```
+
+Readings are returned **newest first**. `next_cursor` is `null` on the last page; pass it back as `?cursor=...` for the next page. `recorded_at` is `null` when the device didn't supply a timestamp on push.
+
+#### Onboarding flow — Shelly H&T Gen3
+
+1. Create the device with the H&T subtype:
+   ```json
+   POST /api/v1/device/devices
+   { "name": "Living Room Sensor",
+     "device_type_id": "sensor",
+     "device_metadata": { "subtype": "shelly_ht_gen3" } }
+   ```
+2. Issue a write-telemetry key:
+   ```bash
+   curl -X POST "$BASE/api/v1/device/devices/$DEV/keys" \
+     -H 'Content-Type: application/json' \
+     -d '{ "scopes": ["write_telemetry"] }'
+   ```
+3. Copy `snippets.shelly_action` from the response into the Shelly device's web UI under **Settings → Actions** (or POST it to `http://<device-ip>/rpc/Webhook.Create`).
+4. The device will fire the action on each wake-up; readings appear under `GET /devices/{id}/telemetry`.
+
+> **Placeholder names** (`${temperature_F}`, `${humidity}`, `${ts}`) in the generated snippet are the design doc's sketch and may differ from the actual Shelly Gen3 RPC variable names. Verify against firmware before applying to a production device — the snippet's `_note` field carries the same warning.
+
+#### Bus events
+
+Each successful telemetry write produces one `device.telemetry` event on the platform's event bus (Pub/Sub on GCP, SQS on AWS). Payload:
+
+```json
+{
+  "event": "device.telemetry",
+  "device_id": "device-...",
+  "device_type": "sensor",
+  "readings": { "temperature": 71.6, "humidity": 44.2 },
+  "recorded_at": "2026-05-12T20:30:00",
+  "received_at": "2026-05-12T20:30:02"
+}
+```
+
+`recorded_at` on the bus is always populated, falling back to `received_at` when the device didn't supply one. Consumers (analytics, automation) should switch on the `event_type` Pub/Sub attribute (`"device.telemetry"`).
 
 ---
 
