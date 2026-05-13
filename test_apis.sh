@@ -207,6 +207,7 @@ reset_flags() {
   unset NAME ID TYPE ROOM TUYA_ID STATE LEVEL COMMAND VALUE EMAIL PASSWORD
   unset METRIC HOURS CATEGORY LIMIT ENABLED ONLINE SCOPES EXPIRES_DAYS PREFS
   unset TEMPLATE_ID SERVICE
+  unset DEVICE_IDS CYCLES STEP_MS MIN_BRIGHTNESS MAX_BRIGHTNESS
 }
 parse_flags() {
   reset_flags
@@ -235,6 +236,11 @@ parse_flags() {
       --prefs)        PREFS="$2";        shift 2 ;;
       --template)     TEMPLATE_ID="$2";  shift 2 ;;
       --service)      SERVICE="$2";      shift 2 ;;
+      --device-ids)     DEVICE_IDS="$2";     shift 2 ;;
+      --cycles)         CYCLES="$2";         shift 2 ;;
+      --step-ms)        STEP_MS="$2";        shift 2 ;;
+      --min-brightness) MIN_BRIGHTNESS="$2"; shift 2 ;;
+      --max-brightness) MAX_BRIGHTNESS="$2"; shift 2 ;;
       *) echo "Unknown flag: $1" >&2; exit 2 ;;
     esac
   done
@@ -317,6 +323,19 @@ op_history() {
   local q=""
   [ -n "${LIMIT:-}" ] && q="?limit=${LIMIT}"
   call GET "/api/v1/automation/history${q}"
+}
+
+op_chase() {
+  need DEVICE_IDS
+  local body
+  body=$(jq -nc \
+    --argjson ids "$(echo "$DEVICE_IDS" | jq -Rc 'split(",")')" \
+    --argjson cycles "${CYCLES:-3}" \
+    --argjson step_ms "${STEP_MS:-500}" \
+    --argjson minb "${MIN_BRIGHTNESS:-10}" \
+    --argjson maxb "${MAX_BRIGHTNESS:-100}" \
+    '{device_ids: $ids, cycles: $cycles, step_ms: $step_ms, min_brightness: $minb, max_brightness: $maxb}')
+  call POST /api/v1/automation/chase 200 "$body"
 }
 
 op_register() {
@@ -441,6 +460,9 @@ AUTOMATION-SERVICE
   rule-disable                  --id RULE_ID
   rule-delete                   --id RULE_ID
   history                       [--limit N]
+  chase                         --device-ids "id1,id2,id3"
+                                [--cycles N] [--step-ms MS]
+                                [--min-brightness 0..100] [--max-brightness 0..100]
 
 USER-SERVICE
   register                      --email E --name N --password P
@@ -479,6 +501,7 @@ EXAMPLES
   test_apis.sh --platform gcp login --email john.doe@example.com --password demo123
   test_apis.sh --platform gcp me
   test_apis.sh --platform gcp raw GET /api/v1/automation/templates/sunset-lights
+  test_apis.sh --platform gcp chase --device-ids "device-7a3f,device-92b1,device-c4d0" --cycles 5
 
 With no operation, runs the full test suite (--list to see this help).
 EOF
@@ -638,6 +661,7 @@ case "$1" in
       rule-disable)      op_rule_disable ;;
       rule-delete)       op_rule_delete ;;
       history)           op_history ;;
+      chase)             op_chase ;;
       register)          op_register ;;
       login)             op_login ;;
       me)                op_me ;;
