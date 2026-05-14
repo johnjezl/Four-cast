@@ -41,6 +41,9 @@
 #   ./test_apis.sh --help                   # Same as --list
 #   ./test_apis.sh <op> [--flag value ...]  # Run one operation
 #
+#   --pretty | -p                           # Multi-line response bodies
+#                                           # (or PRETTY=1 as env var)
+#
 # After `login`, the JWT is saved to /tmp/smarthome-jwt and re-used by
 # subsequent authenticated calls until you run `logout` or `logout-local`.
 #
@@ -62,9 +65,10 @@ if ! command -v jq >/dev/null; then
   exit 1
 fi
 
-# -- Extract --urls-file / --platform (may appear anywhere on the cmd line) ---
+# -- Extract --urls-file / --platform / --pretty (may appear anywhere) -------
 URLS_FILE="${SERVICE_URLS_FILE:-}"
 PLATFORM="${SERVICE_URLS_PLATFORM:-}"
+PRETTY="${PRETTY:-0}"
 REMAINING_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -72,6 +76,7 @@ while [ $# -gt 0 ]; do
     --urls-file=*) URLS_FILE="${1#*=}"; shift ;;
     --platform)    PLATFORM="$2"; shift 2 ;;
     --platform=*)  PLATFORM="${1#*=}"; shift ;;
+    --pretty|-p)   PRETTY=1; shift ;;
     *) REMAINING_ARGS+=("$1"); shift ;;
   esac
 done
@@ -183,14 +188,33 @@ call() {
   fi
   local code
   code=$(curl "${args[@]}" "$url")
-  local preview
-  preview=$(jq -c . < "$RESP" 2>/dev/null || head -c 200 < "$RESP")
+  local ok=1
   if [ "$code" = "$expected" ]; then
-    printf "  %s✓ %s%s %-7s %s %s→%s %s\n" "$GREEN" "$code" "$RST" "$method" "$path" "$DIM" "$RST" "$preview"
     PASS=$((PASS+1))
   else
-    printf "  %s✗ %s%s (expected %s) %-7s %s %s→%s %s\n" "$RED" "$code" "$RST" "$expected" "$method" "$path" "$DIM" "$RST" "$preview"
+    ok=0
     FAIL=$((FAIL+1))
+  fi
+  if [ "$PRETTY" = "1" ]; then
+    # Header line first, then indented multi-line JSON body underneath so
+    # each call's response is easy to scan top-to-bottom in a long suite.
+    if [ "$ok" = "1" ]; then
+      printf "  %s✓ %s%s %-7s %s\n" "$GREEN" "$code" "$RST" "$method" "$path"
+    else
+      printf "  %s✗ %s%s (expected %s) %-7s %s\n" "$RED" "$code" "$RST" "$expected" "$method" "$path"
+    fi
+    if [ -s "$RESP" ]; then
+      jq . < "$RESP" 2>/dev/null | sed 's/^/      /' \
+        || sed 's/^/      /' < "$RESP"
+    fi
+  else
+    local preview
+    preview=$(jq -c . < "$RESP" 2>/dev/null || head -c 200 < "$RESP")
+    if [ "$ok" = "1" ]; then
+      printf "  %s✓ %s%s %-7s %s %s→%s %s\n" "$GREEN" "$code" "$RST" "$method" "$path" "$DIM" "$RST" "$preview"
+    else
+      printf "  %s✗ %s%s (expected %s) %-7s %s %s→%s %s\n" "$RED" "$code" "$RST" "$expected" "$method" "$path" "$DIM" "$RST" "$preview"
+    fi
   fi
 }
 
@@ -434,7 +458,7 @@ op_raw() {
 list_ops() {
   cat <<'EOF'
 Single-operation usage:
-  test_apis.sh [--platform aws|gcp|azure | --urls-file PATH] <op> [--flag value ...]
+  test_apis.sh [--platform aws|gcp|azure | --urls-file PATH] [--pretty|-p] <op> [--flag value ...]
 
 INFO
   info                          --service device|automation|user|analytics
