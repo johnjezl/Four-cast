@@ -10,4 +10,5 @@
 **/lambda.zip
 **/terraform.tfvars
 **/*.auto.tfvars
+**/*.cfg
 **/__pycache__/
