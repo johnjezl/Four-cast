@@ -155,23 +155,55 @@ resource "null_resource" "tcp_keepalives" {
 # Note: `az postgres flexible-server restart` doesn't accept `--yes` (no
 # confirmation prompt to suppress). Don't add one — it errors with
 # `unrecognized arguments: --yes` and halts the destroy mid-flight.
+#
+# The `wait_for_ready` loop after the restart is load-bearing: `az
+# restart` returns once the API accepts the call, not once the server
+# is back to Ready (same gotcha PR #38 fixed for parameter sets). If
+# this resource's destroy returns before the server is actually Ready,
+# the next operations to fire (database delete + firewall_rule delete)
+# hit a still-restarting server and either fail with ServerIsBusy or
+# wedge in azurerm's polling loop until the 60m deadline. The
+# `depends_on` list below includes the firewall rule for the same
+# reason — without it, firewall_rule.destroy races this restart in
+# parallel and hits the same wedge.
 resource "null_resource" "terminate_db_connections" {
   triggers = {
     server_name         = azurerm_postgresql_flexible_server.main.name
     resource_group_name = var.resource_group_name
   }
 
-  # All server-scoped children (database + tcp_keepalives null_resource)
-  # destroy before the restart fires. Reverses to create-time:
-  # server → tcp_keepalives → database → this.
+  # All server-scoped children (database, firewall rule, tcp_keepalives
+  # null_resource) destroy after the restart fires and the server
+  # returns to Ready. Reverses to create-time:
+  # server → tcp_keepalives → database → firewall_rule → this.
   depends_on = [
     azurerm_postgresql_flexible_server_database.main,
+    azurerm_postgresql_flexible_server_firewall_rule.azure_services,
     null_resource.tcp_keepalives,
   ]
 
   provisioner "local-exec" {
     when    = destroy
-    command = "az postgres flexible-server restart --name ${self.triggers.server_name} --resource-group ${self.triggers.resource_group_name}"
+    command = <<-EOT
+      set -e
+      SERVER='${self.triggers.server_name}'
+      RG='${self.triggers.resource_group_name}'
+
+      wait_for_ready() {
+        for _ in $(seq 1 60); do
+          state=$(az postgres flexible-server show --name "$SERVER" --resource-group "$RG" --query state -o tsv 2>/dev/null || echo "")
+          if [ "$state" = "Ready" ]; then
+            return 0
+          fi
+          sleep 10
+        done
+        echo "ERROR: server $SERVER did not return to Ready within 10 minutes (last state: $state)" >&2
+        return 1
+      }
+
+      az postgres flexible-server restart --name "$SERVER" --resource-group "$RG"
+      wait_for_ready
+    EOT
   }
 }
 
