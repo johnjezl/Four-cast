@@ -91,14 +91,36 @@ resource "null_resource" "tcp_keepalives" {
     probes   = "3"
   }
 
-  # Static-parameter changes restart the Flexible Server asynchronously,
-  # and the next `az parameter set` call against a still-restarting
-  # server fails with ServerIsBusy. Wait for the server's state to
-  # return to "Ready" between calls. `az` returns from `parameter set`
-  # once the API accepts the change, NOT once the restart completes —
-  # so the explicit wait loop is required.
+  # Parameter changes restart the Flexible Server asynchronously, and
+  # the next `az parameter set` call against a still-restarting server
+  # fails with ServerIsBusy. `az` returns from `parameter set` once the
+  # API accepts the change, NOT once the change is fully applied — so
+  # an explicit barrier between calls is required.
+  #
+  # `wait_for_ready` polls server.state. That handles the static-
+  # parameter case (where the API publicly reports the server as
+  # Restarting / Updating until the restart completes). It does NOT
+  # cover dynamic parameters: tcp_keepalives_idle/interval/count are
+  # all marked `isDynamicConfig: true` and don't trigger a restart, but
+  # Azure can still report ServerIsBusy for ~tens of seconds after the
+  # set returns. Server state can show Ready while a background
+  # operation lock is still held — verified by hitting this in the
+  # field on a fresh apply.
+  #
+  # `set_param` wraps the call with retry-on-ServerIsBusy and an
+  # exponential-ish 30s backoff. Six attempts ~= up to 3 minutes per
+  # parameter, which is well above the worst lock window observed.
+  # Any other error fails fast — we don't want to mask a real
+  # misconfiguration as a transient.
+  #
+  # `interpreter = ["/bin/bash", ...]` is load-bearing: set_param uses
+  # `local`, which is a bash builtin, not POSIX. Without this, default
+  # /bin/sh on Debian/Ubuntu (dash) errors out at function-call time.
+  # Matches the build_and_push provisioner in aws/terraform/modules/
+  # service/main.tf, which uses the same idiom for the same reason.
   provisioner "local-exec" {
-    command = <<-EOT
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
       set -e
       SERVER='${self.triggers.server_name}'
       RG='${self.triggers.resource_group_name}'
@@ -115,20 +137,35 @@ resource "null_resource" "tcp_keepalives" {
         return 1
       }
 
-      wait_for_ready
-      az postgres flexible-server parameter set \
-        --server-name "$SERVER" --resource-group "$RG" \
-        --name tcp_keepalives_idle --value '${self.triggers.idle}'
+      set_param() {
+        local name=$1 value=$2 out
+        for attempt in 1 2 3 4 5 6; do
+          if out=$(az postgres flexible-server parameter set \
+                     --server-name "$SERVER" --resource-group "$RG" \
+                     --name "$name" --value "$value" 2>&1); then
+            return 0
+          fi
+          if echo "$out" | grep -q "ServerIsBusy"; then
+            echo "ServerIsBusy on $name (attempt $attempt/6) — sleeping 30s" >&2
+            sleep 30
+          else
+            echo "$out" >&2
+            return 1
+          fi
+        done
+        echo "ERROR: $name failed after 6 attempts. Last output:" >&2
+        echo "$out" >&2
+        return 1
+      }
 
       wait_for_ready
-      az postgres flexible-server parameter set \
-        --server-name "$SERVER" --resource-group "$RG" \
-        --name tcp_keepalives_interval --value '${self.triggers.interval}'
+      set_param tcp_keepalives_idle '${self.triggers.idle}'
 
       wait_for_ready
-      az postgres flexible-server parameter set \
-        --server-name "$SERVER" --resource-group "$RG" \
-        --name tcp_keepalives_count --value '${self.triggers.probes}'
+      set_param tcp_keepalives_interval '${self.triggers.interval}'
+
+      wait_for_ready
+      set_param tcp_keepalives_count '${self.triggers.probes}'
 
       wait_for_ready
     EOT
