@@ -86,3 +86,6 @@ variable "log_level" {
     error_message = "log_level must be one of DEBUG, INFO, WARNING, ERROR."
   }
 }
+
+# The `services` variable is declared in services.tf (symlinked from the
+# repo root) and is the single source of truth shared with GCP and Azure.

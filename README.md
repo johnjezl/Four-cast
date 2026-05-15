@@ -44,6 +44,8 @@ cd ../..
 ./test_apis.sh --platform <cloud>              # end-to-end test sweep
 ```
 
+**Give the stack ~60–120 seconds after `terraform apply` exits before running the test sweep.** `terraform apply` returns once each compute resource reports Ready, but several things finish settling after that: load-balancer / ingress routing propagation, IAM-binding propagation (Pub/Sub publishers, Service Bus roles, etc.), the post-create `null_resource` that patches `DEVICE_SERVICE_URL` onto `tuya-bridge` (which itself triggers a new revision rollout), and the first Cloud SQL Auth Proxy / Postgres Flexible Server handshake from a fresh container. Hit `/health` on each service URL a few times until all return `200` before running `test_apis.sh`; otherwise early calls may 404 / 403 / 503 on a stack that's still becoming reachable. And on some platforms, the first API call to each service may still take up to 30 seconds.
+
 ## API
 
 See [`docs/api-guide.md`](docs/api-guide.md) for the public API surface across services.

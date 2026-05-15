@@ -1,12 +1,26 @@
 # =============================================================================
-# ECS Fargate Module
+# ECS shared cluster module
 # =============================================================================
-# Runs containerized microservices on AWS Fargate.
-# Textbook Reference: Ch. 3 - Platform abstraction via containers
+# Owns everything that is one-per-deployment rather than one-per-service:
+#
+#   - ECS cluster
+#   - ALB (+ HTTP listener with fixed-response default)
+#   - Security groups (alb, ecs_tasks)
+#   - IAM roles (execution role, generic task role, scoped tuya-bridge
+#     task role)
+#   - Region data source (re-exported so the per-service module doesn't
+#     need its own provider data lookup)
+#
+# Per-service resources (ECR repo, task def, service, target group,
+# listener rule, log group, build/push provisioner) live in
+# `aws/terraform/modules/service/`, instantiated once per entry in
+# `var.services` from the parent main.tf. This split mirrors the GCP /
+# Azure module shape and is where templatefile() does the heavy lifting
+# for container definitions.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# ECS Cluster
+# ECS cluster
 # -----------------------------------------------------------------------------
 resource "aws_ecs_cluster" "main" {
   name = "${var.name_prefix}-cluster"
@@ -17,67 +31,6 @@ resource "aws_ecs_cluster" "main" {
   }
 
   tags = var.common_tags
-}
-
-# -----------------------------------------------------------------------------
-# ECR Repositories
-# -----------------------------------------------------------------------------
-resource "aws_ecr_repository" "services" {
-  for_each = var.services
-
-  name                 = "${var.name_prefix}-${each.key}"
-  image_tag_mutability = "MUTABLE"
-  force_delete         = true
-
-  image_scanning_configuration {
-    scan_on_push = true
-  }
-
-  tags = var.common_tags
-}
-
-# -----------------------------------------------------------------------------
-# Build and push container images on apply
-# -----------------------------------------------------------------------------
-# Rebuilds only when the relevant service source files actually change.
-# Requires `docker` and `aws` CLI to be available on the machine running
-# `terraform apply`, and the current user to be in the `docker` group.
-resource "null_resource" "build_and_push" {
-  for_each = var.services
-
-  triggers = {
-    repo_url = aws_ecr_repository.services[each.key].repository_url
-    # Trigger covers the per-service source AND shared/ — edits to the
-    # cloud abstraction layer must rebuild every image.
-    src_hash = sha256(join("|", concat(
-      [for f in fileset("${path.root}/../services/${each.key}", "app/**/*.py") :
-      "${f}=${filesha256("${path.root}/../services/${each.key}/${f}")}"],
-      [for f in fileset("${path.root}/../services/${each.key}", "Dockerfile") :
-      "${f}=${filesha256("${path.root}/../services/${each.key}/${f}")}"],
-      [for f in fileset("${path.root}/../services/${each.key}", "requirements.txt") :
-      "${f}=${filesha256("${path.root}/../services/${each.key}/${f}")}"],
-      [for f in fileset("${path.root}/../../shared", "**/*.py") :
-      "shared/${f}=${filesha256("${path.root}/../../shared/${f}")}"],
-    )))
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      set -e
-      REPO_URL="${aws_ecr_repository.services[each.key].repository_url}"
-      REGISTRY="$${REPO_URL%%/*}"
-      REPO_ROOT="${path.root}/../.."
-      DOCKERFILE="aws/services/${each.key}/Dockerfile"
-      REGION="${data.aws_region.current.name}"
-
-      echo ">>> Building and pushing $${REPO_URL}:latest"
-      aws ecr get-login-password --region "$REGION" | \
-        docker login --username AWS --password-stdin "$REGISTRY" >/dev/null
-      docker build -t "$${REPO_URL}:latest" -f "$REPO_ROOT/$DOCKERFILE" "$REPO_ROOT"
-      docker push "$${REPO_URL}:latest"
-    EOT
-  }
 }
 
 # -----------------------------------------------------------------------------
@@ -117,51 +70,7 @@ resource "aws_lb_listener" "http" {
 }
 
 # -----------------------------------------------------------------------------
-# Target Groups & Listener Rules
-# -----------------------------------------------------------------------------
-resource "aws_lb_target_group" "services" {
-  for_each = var.services
-
-  name                 = "${var.name_prefix}-${each.key}"
-  port                 = each.value.port
-  protocol             = "HTTP"
-  vpc_id               = var.vpc_id
-  target_type          = "ip"
-  deregistration_delay = 30
-
-  health_check {
-    enabled             = true
-    healthy_threshold   = 2
-    unhealthy_threshold = 3
-    timeout             = 5
-    interval            = 30
-    path                = each.value.health_path
-    matcher             = "200"
-  }
-
-  tags = var.common_tags
-}
-
-resource "aws_lb_listener_rule" "services" {
-  for_each = var.services
-
-  listener_arn = aws_lb_listener.http.arn
-  priority     = each.value.priority
-
-  action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.services[each.key].arn
-  }
-
-  condition {
-    path_pattern {
-      values = ["/api/v1/${replace(each.key, "-service", "")}/*", "/api/v1/${replace(each.key, "-service", "")}"]
-    }
-  }
-}
-
-# -----------------------------------------------------------------------------
-# Security Groups
+# Security groups
 # -----------------------------------------------------------------------------
 resource "aws_security_group" "alb" {
   name        = "${var.name_prefix}-alb-sg"
@@ -215,117 +124,7 @@ resource "aws_security_group" "ecs_tasks" {
 }
 
 # -----------------------------------------------------------------------------
-# ECS Task Definitions
-# -----------------------------------------------------------------------------
-resource "aws_ecs_task_definition" "services" {
-  for_each = var.services
-
-  family                   = "${var.name_prefix}-${each.key}"
-  network_mode             = "awsvpc"
-  requires_compatibilities = ["FARGATE"]
-  cpu                      = each.value.cpu
-  memory                   = each.value.memory
-  execution_role_arn       = aws_iam_role.ecs_execution.arn
-  # Coupling: the literal "tuya-bridge" must match the key used in
-  # local.services. Rename either side and the bridge silently loses
-  # secretsmanager:GetSecretValue on the Tuya secret. Worth promoting to
-  # a per-service `task_role` field if more services need scoped roles.
-  task_role_arn = each.key == "tuya-bridge" ? aws_iam_role.ecs_task_tuya_bridge.arn : aws_iam_role.ecs_task.arn
-
-  depends_on = [null_resource.build_and_push]
-
-  container_definitions = jsonencode([
-    {
-      name      = each.key
-      image     = "${aws_ecr_repository.services[each.key].repository_url}:latest"
-      essential = true
-
-      portMappings = [
-        {
-          containerPort = each.value.port
-          hostPort      = each.value.port
-          protocol      = "tcp"
-        }
-      ]
-
-      environment = [
-        { name = "CLOUD_PROVIDER", value = "aws" },
-        { name = "SERVICE_NAME", value = each.key },
-        { name = "PORT", value = tostring(each.value.port) },
-        { name = "DATABASE_URL", value = "postgresql+asyncpg://${var.db_username}:${var.db_password}@${var.db_endpoint}/${var.db_name}" },
-        { name = "DEVICE_EVENTS_QUEUE", value = var.device_events_queue },
-        { name = "ENVIRONMENT", value = var.environment },
-        { name = "LOG_LEVEL", value = var.log_level },
-        { name = "TUYA_BRIDGE_URL", value = "http://${aws_lb.main.dns_name}" },
-        { name = "DEVICE_SERVICE_URL", value = "http://${aws_lb.main.dns_name}" },
-        { name = "SECRET_NAME", value = var.tuya_secret_name },
-        { name = "TUYA_DEVICE_IDS", value = var.tuya_device_ids }
-      ]
-
-      # Pulled from Secrets Manager at container start and injected as env
-      # vars. The execution role (not the task role) needs GetSecretValue
-      # on these ARNs.
-      secrets = [
-        { name = "JWT_SECRET", valueFrom = var.jwt_secret_arn },
-        { name = "INTERNAL_TOKEN", valueFrom = var.internal_token_arn }
-      ]
-
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          "awslogs-group"         = "/ecs/${var.name_prefix}-${each.key}"
-          "awslogs-region"        = data.aws_region.current.name
-          "awslogs-stream-prefix" = "ecs"
-        }
-      }
-    }
-  ])
-
-  tags = var.common_tags
-}
-
-# -----------------------------------------------------------------------------
-# ECS Services
-# -----------------------------------------------------------------------------
-resource "aws_ecs_service" "services" {
-  for_each = var.services
-
-  name            = each.key
-  cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.services[each.key].arn
-  desired_count   = var.desired_count
-  launch_type     = "FARGATE"
-
-  network_configuration {
-    security_groups = [aws_security_group.ecs_tasks.id]
-    subnets         = var.private_subnet_ids
-  }
-
-  load_balancer {
-    target_group_arn = aws_lb_target_group.services[each.key].arn
-    container_name   = each.key
-    container_port   = each.value.port
-  }
-
-  depends_on = [aws_lb_listener.http]
-
-  tags = var.common_tags
-}
-
-# -----------------------------------------------------------------------------
-# CloudWatch Log Groups
-# -----------------------------------------------------------------------------
-resource "aws_cloudwatch_log_group" "services" {
-  for_each = var.services
-
-  name              = "/ecs/${var.name_prefix}-${each.key}"
-  retention_in_days = 7
-
-  tags = var.common_tags
-}
-
-# -----------------------------------------------------------------------------
-# IAM Roles
+# IAM roles
 # -----------------------------------------------------------------------------
 resource "aws_iam_role" "ecs_execution" {
   name = "${var.name_prefix}-ecs-execution"
@@ -348,7 +147,7 @@ resource "aws_iam_role_policy_attachment" "ecs_execution" {
 }
 
 # Lets the ECS agent pull JWT_SECRET and INTERNAL_TOKEN from Secrets
-# Manager when starting containers (referenced by the task definition's
+# Manager when starting containers (referenced by every task definition's
 # `secrets` block).
 resource "aws_iam_role_policy" "ecs_execution_secrets" {
   name = "${var.name_prefix}-ecs-execution-secrets"
@@ -401,8 +200,8 @@ resource "aws_iam_role_policy" "ecs_task" {
 }
 
 # Specialized task role for tuya-bridge: adds read access to the Tuya
-# Cloud credentials secret. No other service needs this, so we don't grant
-# it on the generic role.
+# Cloud credentials secret. No other service needs this, so we don't
+# grant it on the generic role.
 resource "aws_iam_role" "ecs_task_tuya_bridge" {
   name = "${var.name_prefix}-ecs-task-tuya-bridge"
 
@@ -433,7 +232,7 @@ resource "aws_iam_role_policy" "ecs_task_tuya_bridge" {
 }
 
 # -----------------------------------------------------------------------------
-# Data Sources
+# Data sources
 # -----------------------------------------------------------------------------
 data "aws_region" "current" {}
 
@@ -448,14 +247,26 @@ output "alb_dns_name" {
   value = aws_lb.main.dns_name
 }
 
+output "alb_listener_arn" {
+  value = aws_lb_listener.http.arn
+}
+
 output "ecs_tasks_security_group_id" {
   value = aws_security_group.ecs_tasks.id
 }
 
-output "service_urls" {
-  value = { for k, v in var.services : k => "http://${aws_lb.main.dns_name}/api/v1/${replace(k, "-service", "")}" }
+output "execution_role_arn" {
+  value = aws_iam_role.ecs_execution.arn
 }
 
-output "ecr_repository_urls" {
-  value = { for k, v in aws_ecr_repository.services : k => v.repository_url }
+output "task_role_arn" {
+  value = aws_iam_role.ecs_task.arn
+}
+
+output "task_role_tuya_bridge_arn" {
+  value = aws_iam_role.ecs_task_tuya_bridge.arn
+}
+
+output "aws_region" {
+  value = data.aws_region.current.name
 }

@@ -103,9 +103,9 @@ variable "tuya_region" {
 }
 
 variable "min_instances" {
-  description = "Container Apps min replica count per service. Keep at 0 for demos unless actively load-testing."
+  description = "Container Apps min replica count per service. Matches GCP's default of 2 so the test suite doesn't hit scale-from-zero cold-start (~10-20s) on every run after the cluster has been idle. Override to 0 if you want to save on idle cost between demos."
   type        = number
-  default     = 0
+  default     = 2
 }
 
 variable "max_instances" {

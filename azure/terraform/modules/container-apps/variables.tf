@@ -17,11 +17,13 @@ variable "environment" {
 }
 
 variable "services" {
+  description = "Merged service map: shared catalog fields (port, health_path, owner) + Azure-specific overrides (cpu, memory) layered in by the caller via local.azure_overrides."
   type = map(object({
-    port   = number
-    cpu    = number
-    memory = string
-    owner  = string
+    port        = number
+    health_path = string
+    owner       = string
+    cpu         = number
+    memory      = string
   }))
 }
 
@@ -119,9 +121,9 @@ variable "servicebus_dlq_name" {
 }
 
 variable "min_instances" {
-  description = "Minimum number of replicas per service."
+  description = "Minimum number of replicas per service. Defaults to 2 (matches the parent's default and the GCP module) so services stay warm between test_apis runs."
   type        = number
-  default     = 0
+  default     = 2
 }
 
 variable "max_instances" {

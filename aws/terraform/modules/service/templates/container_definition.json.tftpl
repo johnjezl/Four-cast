@@ -1,0 +1,24 @@
+[
+  {
+    "name": "${name}",
+    "image": "${image}",
+    "essential": true,
+    "portMappings": [
+      {
+        "containerPort": ${port},
+        "hostPort": ${port},
+        "protocol": "tcp"
+      }
+    ],
+    "environment": ${environment_json},
+    "secrets": ${secrets_json},
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "${log_group}",
+        "awslogs-region": "${aws_region}",
+        "awslogs-stream-prefix": "ecs"
+      }
+    }
+  }
+]

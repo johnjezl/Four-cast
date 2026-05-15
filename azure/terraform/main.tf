@@ -94,40 +94,21 @@ locals {
     ManagedBy   = "Terraform"
   }
 
-  # Container Apps consumption resources use CPU/memory pairs. 0.5 vCPU
-  # and 1Gi memory is the smallest pair with enough headroom for FastAPI
-  # plus SQLAlchemy and cloud SDK clients.
+  # Azure-only per-service knobs merged on top of the shared services map
+  # (see ../../services.tf). Container Apps consumption resources use a
+  # cpu float + memory string. 0.5 vCPU + 1Gi memory is the smallest
+  # pair with enough headroom for FastAPI plus SQLAlchemy and cloud SDK
+  # clients.
+  azure_overrides = {
+    device-service     = { cpu = 0.5, memory = "1Gi" }
+    automation-service = { cpu = 0.5, memory = "1Gi" }
+    user-service       = { cpu = 0.5, memory = "1Gi" }
+    analytics-service  = { cpu = 0.5, memory = "1Gi" }
+    tuya-bridge        = { cpu = 0.5, memory = "1Gi" }
+  }
+
   services = {
-    device-service = {
-      port   = 8001
-      cpu    = 0.5
-      memory = "1Gi"
-      owner  = "Member1"
-    }
-    automation-service = {
-      port   = 8002
-      cpu    = 0.5
-      memory = "1Gi"
-      owner  = "Member2"
-    }
-    user-service = {
-      port   = 8003
-      cpu    = 0.5
-      memory = "1Gi"
-      owner  = "Member3"
-    }
-    analytics-service = {
-      port   = 8004
-      cpu    = 0.5
-      memory = "1Gi"
-      owner  = "Member4"
-    }
-    tuya-bridge = {
-      port   = 8005
-      cpu    = 0.5
-      memory = "1Gi"
-      owner  = "Platform"
-    }
+    for k, v in var.services : k => merge(v, local.azure_overrides[k])
   }
 }
 

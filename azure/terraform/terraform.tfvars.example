@@ -26,6 +26,10 @@ tuya_device_ids    = ""
 # =============================================================================
 # Container Apps sizing
 # =============================================================================
-min_instances = 0
+# Matches GCP's example. Container Apps Consumption bills per kept-warm
+# replica per second, so override to 0 if you want to save on idle cost
+# between demos — but expect a ~10-20s cold start on the first call to
+# each service every ~5 min of idle.
+min_instances = 2
 max_instances = 4
 log_level     = "INFO"

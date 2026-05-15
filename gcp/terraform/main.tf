@@ -59,40 +59,20 @@ provider "google-beta" {
 locals {
   name_prefix = "smarthome-${var.environment}"
 
-  # Cloud Run resource limits use string units ("1", "512Mi") rather than
-  # ECS's CPU shares / MB. 1 vCPU + 512Mi mirrors db.t3.micro-class sizing
-  # and stays within free-tier headroom for short-lived demos.
+  # GCP-only per-service knobs merged on top of the shared services map
+  # (see ../../services.tf). Cloud Run resource limits use string units
+  # ("1" vCPU, "512Mi" memory) rather than ECS's CPU shares / MB —
+  # different shape per cloud, so these stay per-cloud.
+  gcp_overrides = {
+    device-service     = { cpu = "1", memory = "512Mi" }
+    automation-service = { cpu = "1", memory = "512Mi" }
+    user-service       = { cpu = "1", memory = "512Mi" }
+    analytics-service  = { cpu = "1", memory = "512Mi" }
+    tuya-bridge        = { cpu = "1", memory = "512Mi" }
+  }
+
   services = {
-    device-service = {
-      port   = 8001
-      cpu    = "1"
-      memory = "512Mi"
-      owner  = "Member1"
-    }
-    automation-service = {
-      port   = 8002
-      cpu    = "1"
-      memory = "512Mi"
-      owner  = "Member2"
-    }
-    user-service = {
-      port   = 8003
-      cpu    = "1"
-      memory = "512Mi"
-      owner  = "Member3"
-    }
-    analytics-service = {
-      port   = 8004
-      cpu    = "1"
-      memory = "512Mi"
-      owner  = "Member4"
-    }
-    tuya-bridge = {
-      port   = 8005
-      cpu    = "1"
-      memory = "512Mi"
-      owner  = "Platform"
-    }
+    for k, v in var.services : k => merge(v, local.gcp_overrides[k])
   }
 }
 
@@ -216,13 +196,13 @@ resource "google_pubsub_subscription_iam_member" "dlq_subscriber" {
 resource "google_pubsub_topic_iam_member" "device_service_publisher" {
   topic  = google_pubsub_topic.device_events.name
   role   = "roles/pubsub.publisher"
-  member = "serviceAccount:${module.cloud_run.service_account_emails["device-service"]}"
+  member = "serviceAccount:${module.device_service.service_account_email}"
 }
 
 resource "google_pubsub_subscription_iam_member" "analytics_subscriber" {
   subscription = google_pubsub_subscription.device_events.name
   role         = "roles/pubsub.subscriber"
-  member       = "serviceAccount:${module.cloud_run.service_account_emails["analytics-service"]}"
+  member       = "serviceAccount:${module.service["analytics-service"].service_account_email}"
 }
 
 # =============================================================================
@@ -249,7 +229,7 @@ resource "google_secret_manager_secret_version" "tuya_credentials" {
 resource "google_secret_manager_secret_iam_member" "tuya_bridge_accessor" {
   secret_id = google_secret_manager_secret.tuya_credentials.id
   role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${module.cloud_run.service_account_emails["tuya-bridge"]}"
+  member    = "serviceAccount:${module.tuya_bridge.service_account_email}"
 }
 
 # =============================================================================
@@ -289,44 +269,212 @@ resource "time_sleep" "cloud_run_drain" {
 }
 
 # =============================================================================
-# Cloud Run services
+# Cloud Run services — three module calls of one shared body
 # =============================================================================
-module "cloud_run" {
-  source = "./modules/cloud-run"
+# The same `./modules/service` body is used three ways. The split is
+# forced by Terraform's self-referential-block check: a for_each can't
+# reference a sibling instance, so any service that is both a target of
+# a cross-reference (device-service.uri is read by others) and lives
+# in the same for_each as its referrers will fail at plan.
+#
+# Shape:
+#   - module.device_service   — singleton anchor. Its uri is fed into
+#                                the for_each block as DEVICE_SERVICE_URL.
+#                                Itself reads tuya_bridge_url (no cycle:
+#                                tuya_bridge has no input from device).
+#   - module.service[*]       — for_each over [automation, user, analytics].
+#                                Three services that don't sit on either
+#                                side of a cross-ref cycle.
+#   - module.tuya_bridge      — singleton with ignore_env_changes = true.
+#                                DEVICE_SERVICE_URL gets patched in by
+#                                null_resource.patch_tuya_bridge_url
+#                                below, after device-service exists.
+#
+# Common inputs are factored into local.service_common to keep the
+# three call sites readable.
+locals {
+  service_common = {
+    name_prefix        = local.name_prefix
+    environment        = var.environment
+    log_level          = var.log_level
+    project_id         = var.gcp_project_id
+    region             = var.gcp_region
+    min_instances      = var.min_instances
+    max_instances      = var.max_instances
+    db_connection_name = module.database.connection_name
+    db_name            = module.database.db_name
+    db_username        = var.db_username
+    db_password        = var.db_password
+    jwt_secret_id      = google_secret_manager_secret.jwt_secret.secret_id
+    internal_token_id  = google_secret_manager_secret.internal_token.secret_id
+    event_topic        = google_pubsub_topic.device_events.name
+    event_subscription = google_pubsub_subscription.device_events.name
+    tuya_secret_name   = google_secret_manager_secret.tuya_credentials.secret_id
+    tuya_device_ids    = var.tuya_device_ids
+  }
+}
 
-  project_id  = var.gcp_project_id
-  region      = var.gcp_region
-  name_prefix = local.name_prefix
-  environment = var.environment
+module "tuya_bridge" {
+  source = "./modules/service"
 
-  services           = local.services
-  image_urls         = module.registry.image_urls
-  db_connection_name = module.database.connection_name
-  db_name            = module.database.db_name
-  db_username        = var.db_username
-  db_password        = var.db_password
+  service_name = "tuya-bridge"
+  port         = local.services["tuya-bridge"].port
+  cpu          = local.services["tuya-bridge"].cpu
+  memory       = local.services["tuya-bridge"].memory
+  image_url    = module.registry.image_urls["tuya-bridge"]
 
-  jwt_secret_id     = google_secret_manager_secret.jwt_secret.secret_id
-  internal_token_id = google_secret_manager_secret.internal_token.secret_id
-  tuya_device_ids   = var.tuya_device_ids
+  name_prefix        = local.service_common.name_prefix
+  environment        = local.service_common.environment
+  log_level          = local.service_common.log_level
+  project_id         = local.service_common.project_id
+  region             = local.service_common.region
+  min_instances      = local.service_common.min_instances
+  max_instances      = local.service_common.max_instances
+  db_connection_name = local.service_common.db_connection_name
+  db_name            = local.service_common.db_name
+  db_username        = local.service_common.db_username
+  db_password        = local.service_common.db_password
+  jwt_secret_id      = local.service_common.jwt_secret_id
+  internal_token_id  = local.service_common.internal_token_id
+  event_topic        = local.service_common.event_topic
+  event_subscription = local.service_common.event_subscription
+  tuya_secret_name   = local.service_common.tuya_secret_name
+  tuya_device_ids    = local.service_common.tuya_device_ids
 
-  event_topic        = google_pubsub_topic.device_events.name
-  event_subscription = google_pubsub_subscription.device_events.name
-  tuya_secret_name   = google_secret_manager_secret.tuya_credentials.secret_id
-
-  min_instances = var.min_instances
-  max_instances = var.max_instances
-  log_level     = var.log_level
+  # DEVICE_SERVICE_URL is patched in post-create — see
+  # null_resource.patch_tuya_bridge_url below.
+  ignore_env_changes = true
 
   depends_on = [time_sleep.cloud_run_drain]
+}
+
+module "device_service" {
+  source = "./modules/service"
+
+  service_name = "device-service"
+  port         = local.services["device-service"].port
+  cpu          = local.services["device-service"].cpu
+  memory       = local.services["device-service"].memory
+  image_url    = module.registry.image_urls["device-service"]
+
+  name_prefix        = local.service_common.name_prefix
+  environment        = local.service_common.environment
+  log_level          = local.service_common.log_level
+  project_id         = local.service_common.project_id
+  region             = local.service_common.region
+  min_instances      = local.service_common.min_instances
+  max_instances      = local.service_common.max_instances
+  db_connection_name = local.service_common.db_connection_name
+  db_name            = local.service_common.db_name
+  db_username        = local.service_common.db_username
+  db_password        = local.service_common.db_password
+  jwt_secret_id      = local.service_common.jwt_secret_id
+  internal_token_id  = local.service_common.internal_token_id
+  event_topic        = local.service_common.event_topic
+  event_subscription = local.service_common.event_subscription
+  tuya_secret_name   = local.service_common.tuya_secret_name
+  tuya_device_ids    = local.service_common.tuya_device_ids
+
+  # device-service dispatches commands to tuya-bridge. The reverse
+  # direction (DEVICE_SERVICE_URL on tuya-bridge) is patched in by
+  # null_resource below — that's how the cycle is broken.
+  tuya_bridge_url = module.tuya_bridge.url
+
+  depends_on = [time_sleep.cloud_run_drain]
+}
+
+module "service" {
+  source = "./modules/service"
+
+  for_each = {
+    for k, v in local.services :
+    k => v if !contains(["device-service", "tuya-bridge"], k)
+  }
+
+  service_name = each.key
+  port         = each.value.port
+  cpu          = each.value.cpu
+  memory       = each.value.memory
+  image_url    = module.registry.image_urls[each.key]
+
+  name_prefix        = local.service_common.name_prefix
+  environment        = local.service_common.environment
+  log_level          = local.service_common.log_level
+  project_id         = local.service_common.project_id
+  region             = local.service_common.region
+  min_instances      = local.service_common.min_instances
+  max_instances      = local.service_common.max_instances
+  db_connection_name = local.service_common.db_connection_name
+  db_name            = local.service_common.db_name
+  db_username        = local.service_common.db_username
+  db_password        = local.service_common.db_password
+  jwt_secret_id      = local.service_common.jwt_secret_id
+  internal_token_id  = local.service_common.internal_token_id
+  event_topic        = local.service_common.event_topic
+  event_subscription = local.service_common.event_subscription
+  tuya_secret_name   = local.service_common.tuya_secret_name
+  tuya_device_ids    = local.service_common.tuya_device_ids
+
+  # analytics-service queries device-service for live counts;
+  # automation-service issues device commands as part of rule execution
+  # (e.g., /chase). user-service doesn't call device — the extra env
+  # var is harmless. Filtering it out per-service would mean splitting
+  # the for_each further; not worth the readability cost.
+  device_service_url = module.device_service.url
+
+  depends_on = [time_sleep.cloud_run_drain]
+}
+
+# =============================================================================
+# Post-create patch: DEVICE_SERVICE_URL on tuya-bridge
+# =============================================================================
+# tuya-bridge doesn't know device-service's URL at create time (it
+# can't — see module header). We create tuya-bridge first (no cross-ref),
+# create device-service (which references tuya-bridge.uri), then patch
+# tuya-bridge with device-service's URL via gcloud.
+#
+# replace_triggered_by re-runs the patch whenever tuya-bridge is
+# replaced for any reason (image change, resource-limit change, etc.) —
+# without it, those updates would create a new revision from the
+# declared template (which lacks DEVICE_SERVICE_URL) and silently drop
+# the URL until someone noticed.
+resource "null_resource" "patch_tuya_bridge_url" {
+  # `latest_created_revision` changes on every in-place update of the
+  # tuya-bridge Cloud Run service (image change, resource-limit change,
+  # etc.), which is what we want to retrigger the patch on. From parent
+  # scope we can't use `replace_triggered_by` (it requires literal
+  # resource references and can't see across module boundaries), so we
+  # surface the revision string as a module output and trigger on it.
+  triggers = {
+    tuya_bridge_revision = module.tuya_bridge.latest_created_revision
+    device_service_url   = module.device_service.url
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      TUYA_NAME="${local.name_prefix}-tuya-bridge"
+      echo ">>> Patching DEVICE_SERVICE_URL on $${TUYA_NAME}"
+      gcloud run services update "$${TUYA_NAME}" \
+        --region="${var.gcp_region}" \
+        --project="${var.gcp_project_id}" \
+        --update-env-vars="DEVICE_SERVICE_URL=${module.device_service.url}" \
+        --quiet >/dev/null
+    EOT
+  }
 }
 
 # =============================================================================
 # Outputs
 # =============================================================================
 output "service_urls" {
-  description = "Per-service public URLs (*.run.app). There is no shared API Gateway in this deployment — each service is reached directly."
-  value       = module.cloud_run.service_urls
+  description = "Per-service public URLs (*.run.app). Composed from the three module call sites. There is no shared API Gateway in this deployment — each service is reached directly."
+  value = merge(
+    { "device-service" = module.device_service.url },
+    { "tuya-bridge" = module.tuya_bridge.url },
+    { for k, mod in module.service : k => mod.url },
+  )
 }
 
 output "db_connection_name" {

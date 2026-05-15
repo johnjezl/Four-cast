@@ -57,50 +57,21 @@ locals {
     Team        = "CloudComputingClass"
   }
 
-  # ALB listener-rule priorities are explicit so adding/renaming a service
-  # can't silently renumber existing rules. Leave gaps between values for
-  # future insertions.
+  # AWS-only per-service knobs merged on top of the shared services map
+  # (which carries `port`, `health_path`, `owner` — see
+  # ../../services.auto.tfvars). ECS uses CPU shares + MiB; the ALB
+  # listener rule needs an explicit priority so adding/renaming a service
+  # can't silently renumber existing rules. Gaps left for future inserts.
+  aws_overrides = {
+    device-service     = { cpu = 256, memory = 512, priority = 100 }
+    automation-service = { cpu = 256, memory = 512, priority = 110 }
+    user-service       = { cpu = 256, memory = 512, priority = 120 }
+    analytics-service  = { cpu = 256, memory = 512, priority = 130 }
+    tuya-bridge        = { cpu = 256, memory = 512, priority = 140 }
+  }
+
   services = {
-    device-service = {
-      port        = 8001
-      cpu         = 256
-      memory      = 512
-      health_path = "/health"
-      owner       = "Member1"
-      priority    = 100
-    }
-    automation-service = {
-      port        = 8002
-      cpu         = 256
-      memory      = 512
-      health_path = "/health"
-      owner       = "Member2"
-      priority    = 110
-    }
-    user-service = {
-      port        = 8003
-      cpu         = 256
-      memory      = 512
-      health_path = "/health"
-      owner       = "Member3"
-      priority    = 120
-    }
-    analytics-service = {
-      port        = 8004
-      cpu         = 256
-      memory      = 512
-      health_path = "/health"
-      owner       = "Member4"
-      priority    = 130
-    }
-    tuya-bridge = {
-      port        = 8005
-      cpu         = 256
-      memory      = 512
-      health_path = "/health"
-      owner       = "Platform"
-      priority    = 140
-    }
+    for k, v in var.services : k => merge(v, local.aws_overrides[k])
   }
 }
 
@@ -128,7 +99,7 @@ module "database" {
   private_subnet_ids      = module.networking.private_subnet_ids
   db_username             = var.db_username
   db_password             = var.db_password
-  allowed_security_groups = [module.ecs.ecs_tasks_security_group_id]
+  allowed_security_groups = [module.cluster.ecs_tasks_security_group_id]
   common_tags             = local.common_tags
 }
 
@@ -226,32 +197,70 @@ resource "aws_secretsmanager_secret_version" "tuya_credentials" {
 }
 
 # =============================================================================
-# ECS Cluster Module (Fargate)
+# ECS shared cluster (Fargate cluster + ALB + IAM + SGs)
 # =============================================================================
-module "ecs" {
+module "cluster" {
   source = "./modules/ecs"
 
-  name_prefix        = local.name_prefix
-  environment        = var.environment
-  vpc_id             = module.networking.vpc_id
-  private_subnet_ids = module.networking.private_subnet_ids
-  public_subnet_ids  = module.networking.public_subnet_ids
-  services           = local.services
-  db_endpoint        = module.database.db_endpoint
-  db_name            = module.database.db_name
-  db_username        = var.db_username
-  db_password        = var.db_password
+  name_prefix       = local.name_prefix
+  environment       = var.environment
+  vpc_id            = module.networking.vpc_id
+  public_subnet_ids = module.networking.public_subnet_ids
+
   jwt_secret_arn     = aws_secretsmanager_secret.jwt_secret.arn
   internal_token_arn = aws_secretsmanager_secret.internal_token.arn
-  desired_count      = var.desired_count
-  log_level          = var.log_level
-
-  device_events_queue = aws_sqs_queue.device_events.url
-  tuya_secret_name    = aws_secretsmanager_secret.tuya_credentials.name
-  tuya_secret_arn     = aws_secretsmanager_secret.tuya_credentials.arn
-  tuya_device_ids     = var.tuya_device_ids
+  tuya_secret_arn    = aws_secretsmanager_secret.tuya_credentials.arn
 
   common_tags = local.common_tags
+}
+
+# =============================================================================
+# Per-service module — one instance per entry in the shared services map
+# =============================================================================
+# Each instance owns its ECR repo, image build/push, log group, ALB target
+# group + listener rule, ECS task def (rendered via templatefile), and
+# ECS service. The shared cluster bits live in module.cluster above.
+module "service" {
+  source = "./modules/service"
+
+  for_each = local.services
+
+  service_name  = each.key
+  port          = each.value.port
+  health_path   = each.value.health_path
+  cpu           = each.value.cpu
+  memory        = each.value.memory
+  priority      = each.value.priority
+  desired_count = var.desired_count
+
+  name_prefix = local.name_prefix
+  environment = var.environment
+  log_level   = var.log_level
+  common_tags = local.common_tags
+
+  cluster_id                  = module.cluster.cluster_id
+  alb_listener_arn            = module.cluster.alb_listener_arn
+  alb_dns_name                = module.cluster.alb_dns_name
+  vpc_id                      = module.networking.vpc_id
+  private_subnet_ids          = module.networking.private_subnet_ids
+  ecs_tasks_security_group_id = module.cluster.ecs_tasks_security_group_id
+  execution_role_arn          = module.cluster.execution_role_arn
+  # tuya-bridge is the only service that reads the Tuya secret. Keying off
+  # the literal service name keeps the special case visible in main.tf
+  # rather than buried in the module.
+  task_role_arn = each.key == "tuya-bridge" ? module.cluster.task_role_tuya_bridge_arn : module.cluster.task_role_arn
+  aws_region    = module.cluster.aws_region
+
+  db_endpoint = module.database.db_endpoint
+  db_name     = module.database.db_name
+  db_username = var.db_username
+  db_password = var.db_password
+
+  device_events_queue = aws_sqs_queue.device_events.url
+  jwt_secret_arn      = aws_secretsmanager_secret.jwt_secret.arn
+  internal_token_arn  = aws_secretsmanager_secret.internal_token.arn
+  tuya_secret_name    = aws_secretsmanager_secret.tuya_credentials.name
+  tuya_device_ids     = var.tuya_device_ids
 }
 
 # =============================================================================
@@ -262,7 +271,7 @@ module "api_gateway" {
 
   name_prefix  = local.name_prefix
   environment  = var.environment
-  alb_dns_name = module.ecs.alb_dns_name
+  alb_dns_name = module.cluster.alb_dns_name
   services     = local.services
   common_tags  = local.common_tags
 }
@@ -277,7 +286,7 @@ output "api_gateway_url" {
 
 output "alb_dns_name" {
   description = "Application Load Balancer DNS"
-  value       = module.ecs.alb_dns_name
+  value       = module.cluster.alb_dns_name
 }
 
 output "device_events_queue" {
@@ -286,6 +295,6 @@ output "device_events_queue" {
 }
 
 output "service_urls" {
-  description = "URLs for each microservice"
-  value       = module.ecs.service_urls
+  description = "URLs for each microservice. Composed from each per-service module instance's `url` output."
+  value       = { for k, mod in module.service : k => mod.url }
 }

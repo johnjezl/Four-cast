@@ -1,12 +1,17 @@
 # =============================================================================
-# Container Apps Module
+# Azure Container Apps module
 # =============================================================================
-# Three resource blocks for the five services:
-#   - azurerm_container_app.main: automation, user, analytics
-#   - azurerm_container_app.device_service: split out because analytics
-#     and tuya-bridge need to reference its URL
-#   - azurerm_container_app.tuya_bridge: split out because
-#     DEVICE_SERVICE_URL is patched in after create
+# Thin wrapper: owns the shared Container Apps environment + Log Analytics
+# workspace, then calls ./service three ways for the five microservices.
+# The per-service detail (managed identity, RBAC, Container App, env
+# templating) lives in the sub-module — see ./service/main.tf.
+#
+# The three-way call pattern (singleton tuya_bridge / singleton
+# device_service / for_each over the middle three) matches gcp/terraform.
+# It's forced by Terraform's self-referential-block check: a `for_each`
+# instance can't reference another instance of the same module at
+# create time, so any service that's the target of a cross-reference
+# must live in its own module call.
 # =============================================================================
 
 locals {
@@ -14,76 +19,7 @@ locals {
 }
 
 # -----------------------------------------------------------------------------
-# Per-service managed identities
-# -----------------------------------------------------------------------------
-resource "azurerm_user_assigned_identity" "services" {
-  for_each = var.services
-
-  name                = "${local.azure_name_prefix}-${replace(each.key, "-service", "")}-id"
-  location            = var.location
-  resource_group_name = var.resource_group_name
-  tags                = var.tags
-}
-
-# Pull images from the private ACR.
-resource "azurerm_role_assignment" "acr_pull" {
-  for_each = var.services
-
-  scope                = var.registry_id
-  role_definition_name = "AcrPull"
-  principal_id         = azurerm_user_assigned_identity.services[each.key].principal_id
-}
-
-# Every service needs the shared app secrets, but the Tuya credential
-# secret is granted only to tuya-bridge below. Iterate var.services (static
-# keys) and look up principal_ids by key so for_each is resolvable before
-# the identity resources exist — required for `terraform import`.
-locals {
-  app_secret_grants = flatten([
-    for service_key, _ in var.services : [
-      {
-        key          = "${service_key}-jwt"
-        principal_id = azurerm_user_assigned_identity.services[service_key].principal_id
-        scope        = var.jwt_secret_scope
-      },
-      {
-        key          = "${service_key}-internal"
-        principal_id = azurerm_user_assigned_identity.services[service_key].principal_id
-        scope        = var.internal_token_scope
-      },
-    ]
-  ])
-}
-
-resource "azurerm_role_assignment" "app_secrets" {
-  for_each = { for grant in local.app_secret_grants : grant.key => grant }
-
-  scope                = each.value.scope
-  role_definition_name = "Key Vault Secrets User"
-  principal_id         = each.value.principal_id
-}
-
-resource "azurerm_role_assignment" "tuya_bridge_secret" {
-  scope                = var.tuya_secret_scope
-  role_definition_name = "Key Vault Secrets User"
-  principal_id         = azurerm_user_assigned_identity.services["tuya-bridge"].principal_id
-}
-
-# Least-privilege Service Bus data-plane roles.
-resource "azurerm_role_assignment" "device_service_sender" {
-  scope                = var.servicebus_queue_id
-  role_definition_name = "Azure Service Bus Data Sender"
-  principal_id         = azurerm_user_assigned_identity.services["device-service"].principal_id
-}
-
-resource "azurerm_role_assignment" "analytics_service_receiver" {
-  scope                = var.servicebus_queue_id
-  role_definition_name = "Azure Service Bus Data Receiver"
-  principal_id         = azurerm_user_assigned_identity.services["analytics-service"].principal_id
-}
-
-# -----------------------------------------------------------------------------
-# Container Apps environment
+# Container Apps environment + Log Analytics workspace
 # -----------------------------------------------------------------------------
 resource "azurerm_log_analytics_workspace" "main" {
   name                = "${local.azure_name_prefix}-logs"
@@ -103,421 +39,229 @@ resource "azurerm_container_app_environment" "main" {
 }
 
 # -----------------------------------------------------------------------------
-# Shared template config
+# Per-service sub-module calls
 # -----------------------------------------------------------------------------
+# Common inputs factored into local.service_common to keep the three
+# call sites readable. The cross-service URL inputs (device_service_url,
+# tuya_bridge_url, ignore_env_changes) differ per call.
 locals {
-  base_env = [
-    { name = "CLOUD_PROVIDER", value = "azure" },
-    { name = "AZURE_KEY_VAULT_URL", value = var.key_vault_url },
-    { name = "AZURE_SERVICEBUS_FULLY_QUALIFIED_NAMESPACE", value = var.servicebus_namespace_fqdn },
-    { name = "SERVICEBUS_QUEUE", value = var.servicebus_queue_name },
-    { name = "SERVICEBUS_DLQ_QUEUE", value = var.servicebus_dlq_name },
-    { name = "SECRET_NAME", value = var.tuya_secret_name },
-    { name = "ENVIRONMENT", value = var.environment },
-    { name = "LOG_LEVEL", value = var.log_level },
-    { name = "DATABASE_URL", value = "postgresql+asyncpg://${var.db_username}:${var.db_password}@${var.db_host}:5432/${var.db_name}?ssl=require" },
-    { name = "TUYA_DEVICE_IDS", value = var.tuya_device_ids },
-  ]
+  service_common = {
+    azure_name_prefix            = local.azure_name_prefix
+    environment                  = var.environment
+    log_level                    = var.log_level
+    resource_group_name          = var.resource_group_name
+    location                     = var.location
+    tags                         = var.tags
+    container_app_environment_id = azurerm_container_app_environment.main.id
+    registry_id                  = var.registry_id
+    registry_login_server        = var.registry_login_server
+    min_instances                = var.min_instances
+    max_instances                = var.max_instances
+
+    db_host     = var.db_host
+    db_name     = var.db_name
+    db_username = var.db_username
+    db_password = var.db_password
+
+    key_vault_url        = var.key_vault_url
+    jwt_secret_id        = var.jwt_secret_id
+    jwt_secret_scope     = var.jwt_secret_scope
+    internal_token_id    = var.internal_token_id
+    internal_token_scope = var.internal_token_scope
+    tuya_secret_id       = var.tuya_secret_id
+    tuya_secret_scope    = var.tuya_secret_scope
+    tuya_secret_name     = var.tuya_secret_name
+    tuya_device_ids      = var.tuya_device_ids
+
+    servicebus_namespace_fqdn = var.servicebus_namespace_fqdn
+    servicebus_queue_name     = var.servicebus_queue_name
+    servicebus_queue_id       = var.servicebus_queue_id
+    servicebus_dlq_name       = var.servicebus_dlq_name
+  }
 }
 
-# -----------------------------------------------------------------------------
-# Container Apps (automation, user, analytics)
-# -----------------------------------------------------------------------------
-resource "azurerm_container_app" "main" {
-  for_each = { for k, v in var.services : k => v if k != "tuya-bridge" && k != "device-service" }
+module "tuya_bridge" {
+  source = "./service"
 
-  name                         = "${local.azure_name_prefix}-${each.key}"
-  container_app_environment_id = azurerm_container_app_environment.main.id
-  resource_group_name          = var.resource_group_name
-  revision_mode                = "Single"
-  tags                         = var.tags
+  service_name = "tuya-bridge"
+  port         = var.services["tuya-bridge"].port
+  cpu          = var.services["tuya-bridge"].cpu
+  memory       = var.services["tuya-bridge"].memory
+  image_url    = var.image_urls["tuya-bridge"]
 
-  identity {
-    type         = "UserAssigned"
-    identity_ids = [azurerm_user_assigned_identity.services[each.key].id]
-  }
+  azure_name_prefix            = local.service_common.azure_name_prefix
+  environment                  = local.service_common.environment
+  log_level                    = local.service_common.log_level
+  resource_group_name          = local.service_common.resource_group_name
+  location                     = local.service_common.location
+  tags                         = local.service_common.tags
+  container_app_environment_id = local.service_common.container_app_environment_id
+  registry_id                  = local.service_common.registry_id
+  registry_login_server        = local.service_common.registry_login_server
+  min_instances                = local.service_common.min_instances
+  max_instances                = local.service_common.max_instances
 
-  registry {
-    server   = var.registry_login_server
-    identity = azurerm_user_assigned_identity.services[each.key].id
-  }
+  db_host     = local.service_common.db_host
+  db_name     = local.service_common.db_name
+  db_username = local.service_common.db_username
+  db_password = local.service_common.db_password
 
-  secret {
-    name                = "jwt-secret"
-    key_vault_secret_id = var.jwt_secret_id
-    identity            = azurerm_user_assigned_identity.services[each.key].id
-  }
+  key_vault_url        = local.service_common.key_vault_url
+  jwt_secret_id        = local.service_common.jwt_secret_id
+  jwt_secret_scope     = local.service_common.jwt_secret_scope
+  internal_token_id    = local.service_common.internal_token_id
+  internal_token_scope = local.service_common.internal_token_scope
+  tuya_secret_id       = local.service_common.tuya_secret_id
+  tuya_secret_scope    = local.service_common.tuya_secret_scope
+  tuya_secret_name     = local.service_common.tuya_secret_name
+  tuya_device_ids      = local.service_common.tuya_device_ids
 
-  secret {
-    name                = "internal-token"
-    key_vault_secret_id = var.internal_token_id
-    identity            = azurerm_user_assigned_identity.services[each.key].id
-  }
+  servicebus_namespace_fqdn = local.service_common.servicebus_namespace_fqdn
+  servicebus_queue_name     = local.service_common.servicebus_queue_name
+  servicebus_queue_id       = local.service_common.servicebus_queue_id
+  servicebus_dlq_name       = local.service_common.servicebus_dlq_name
 
-  ingress {
-    external_enabled           = true
-    target_port                = each.value.port
-    transport                  = "http"
-    allow_insecure_connections = false
+  # tuya-bridge is the only service that reads the Tuya secret.
+  grant_tuya_secret_access = true
+  servicebus_role          = "none"
 
-    traffic_weight {
-      latest_revision = true
-      percentage      = 100
-    }
-  }
-
-  template {
-    min_replicas = var.min_instances
-    max_replicas = var.max_instances
-
-    container {
-      name   = replace(each.key, "-", "")
-      image  = var.image_urls[each.key]
-      cpu    = each.value.cpu
-      memory = each.value.memory
-
-      startup_probe {
-        path                    = "/health"
-        port                    = each.value.port
-        transport               = "HTTP"
-        initial_delay           = 10
-        interval_seconds        = 10
-        timeout                 = 5
-        failure_count_threshold = 6
-      }
-
-      liveness_probe {
-        path                    = "/health"
-        port                    = each.value.port
-        transport               = "HTTP"
-        interval_seconds        = 30
-        timeout                 = 5
-        failure_count_threshold = 3
-      }
-
-      dynamic "env" {
-        for_each = local.base_env
-        content {
-          name  = env.value.name
-          value = env.value.value
-        }
-      }
-
-      env {
-        name        = "JWT_SECRET"
-        secret_name = "jwt-secret"
-      }
-
-      env {
-        name        = "INTERNAL_TOKEN"
-        secret_name = "internal-token"
-      }
-
-      env {
-        name  = "SERVICE_NAME"
-        value = each.key
-      }
-
-      env {
-        name  = "PORT"
-        value = tostring(each.value.port)
-      }
-
-      env {
-        name  = "AZURE_CLIENT_ID"
-        value = azurerm_user_assigned_identity.services[each.key].client_id
-      }
-
-      # analytics-service queries device-service for live counts;
-      # automation-service issues device commands as part of rule
-      # execution (e.g., the /chase demo endpoint). Same shape as the
-      # equivalent dynamic block in gcp/terraform/modules/cloud-run/main.tf.
-      dynamic "env" {
-        for_each = contains(["analytics-service", "automation-service"], each.key) ? ["https://${azurerm_container_app.device_service.ingress[0].fqdn}"] : []
-        content {
-          name  = "DEVICE_SERVICE_URL"
-          value = env.value
-        }
-      }
-    }
-  }
-
-  depends_on = [
-    azurerm_role_assignment.acr_pull,
-    azurerm_role_assignment.app_secrets,
-    azurerm_role_assignment.device_service_sender,
-    azurerm_role_assignment.analytics_service_receiver,
-  ]
+  # DEVICE_SERVICE_URL is patched in post-create — see
+  # null_resource.patch_tuya_bridge_url below.
+  ignore_env_changes = true
 }
 
-# -----------------------------------------------------------------------------
-# Container App: device-service (split out because analytics + tuya-bridge
-# both need to reference its URL cross-resource)
-# -----------------------------------------------------------------------------
-resource "azurerm_container_app" "device_service" {
-  name                         = "${local.azure_name_prefix}-device-service"
-  container_app_environment_id = azurerm_container_app_environment.main.id
-  resource_group_name          = var.resource_group_name
-  revision_mode                = "Single"
-  tags                         = var.tags
+module "device_service" {
+  source = "./service"
 
-  identity {
-    type         = "UserAssigned"
-    identity_ids = [azurerm_user_assigned_identity.services["device-service"].id]
-  }
+  service_name = "device-service"
+  port         = var.services["device-service"].port
+  cpu          = var.services["device-service"].cpu
+  memory       = var.services["device-service"].memory
+  image_url    = var.image_urls["device-service"]
 
-  registry {
-    server   = var.registry_login_server
-    identity = azurerm_user_assigned_identity.services["device-service"].id
-  }
+  azure_name_prefix            = local.service_common.azure_name_prefix
+  environment                  = local.service_common.environment
+  log_level                    = local.service_common.log_level
+  resource_group_name          = local.service_common.resource_group_name
+  location                     = local.service_common.location
+  tags                         = local.service_common.tags
+  container_app_environment_id = local.service_common.container_app_environment_id
+  registry_id                  = local.service_common.registry_id
+  registry_login_server        = local.service_common.registry_login_server
+  min_instances                = local.service_common.min_instances
+  max_instances                = local.service_common.max_instances
 
-  secret {
-    name                = "jwt-secret"
-    key_vault_secret_id = var.jwt_secret_id
-    identity            = azurerm_user_assigned_identity.services["device-service"].id
-  }
+  db_host     = local.service_common.db_host
+  db_name     = local.service_common.db_name
+  db_username = local.service_common.db_username
+  db_password = local.service_common.db_password
 
-  secret {
-    name                = "internal-token"
-    key_vault_secret_id = var.internal_token_id
-    identity            = azurerm_user_assigned_identity.services["device-service"].id
-  }
+  key_vault_url        = local.service_common.key_vault_url
+  jwt_secret_id        = local.service_common.jwt_secret_id
+  jwt_secret_scope     = local.service_common.jwt_secret_scope
+  internal_token_id    = local.service_common.internal_token_id
+  internal_token_scope = local.service_common.internal_token_scope
+  tuya_secret_id       = local.service_common.tuya_secret_id
+  tuya_secret_scope    = local.service_common.tuya_secret_scope
+  tuya_secret_name     = local.service_common.tuya_secret_name
+  tuya_device_ids      = local.service_common.tuya_device_ids
 
-  ingress {
-    external_enabled           = true
-    target_port                = var.services["device-service"].port
-    transport                  = "http"
-    allow_insecure_connections = false
+  servicebus_namespace_fqdn = local.service_common.servicebus_namespace_fqdn
+  servicebus_queue_name     = local.service_common.servicebus_queue_name
+  servicebus_queue_id       = local.service_common.servicebus_queue_id
+  servicebus_dlq_name       = local.service_common.servicebus_dlq_name
 
-    traffic_weight {
-      latest_revision = true
-      percentage      = 100
-    }
-  }
+  # device-service writes to Service Bus.
+  servicebus_role = "sender"
 
-  template {
-    min_replicas = var.min_instances
-    max_replicas = var.max_instances
-
-    container {
-      name   = "deviceservice"
-      image  = var.image_urls["device-service"]
-      cpu    = var.services["device-service"].cpu
-      memory = var.services["device-service"].memory
-
-      startup_probe {
-        path                    = "/health"
-        port                    = var.services["device-service"].port
-        transport               = "HTTP"
-        initial_delay           = 10
-        interval_seconds        = 10
-        timeout                 = 5
-        failure_count_threshold = 6
-      }
-
-      liveness_probe {
-        path                    = "/health"
-        port                    = var.services["device-service"].port
-        transport               = "HTTP"
-        interval_seconds        = 30
-        timeout                 = 5
-        failure_count_threshold = 3
-      }
-
-      dynamic "env" {
-        for_each = local.base_env
-        content {
-          name  = env.value.name
-          value = env.value.value
-        }
-      }
-
-      env {
-        name        = "JWT_SECRET"
-        secret_name = "jwt-secret"
-      }
-
-      env {
-        name        = "INTERNAL_TOKEN"
-        secret_name = "internal-token"
-      }
-
-      env {
-        name  = "SERVICE_NAME"
-        value = "device-service"
-      }
-
-      env {
-        name  = "PORT"
-        value = tostring(var.services["device-service"].port)
-      }
-
-      env {
-        name  = "AZURE_CLIENT_ID"
-        value = azurerm_user_assigned_identity.services["device-service"].client_id
-      }
-
-      env {
-        name  = "TUYA_BRIDGE_URL"
-        value = "https://${azurerm_container_app.tuya_bridge.ingress[0].fqdn}"
-      }
-    }
-  }
-
-  depends_on = [
-    azurerm_role_assignment.acr_pull,
-    azurerm_role_assignment.app_secrets,
-    azurerm_role_assignment.device_service_sender,
-  ]
+  # device-service dispatches commands to tuya-bridge. The reverse is
+  # patched in post-create.
+  tuya_bridge_url = module.tuya_bridge.url
 }
 
-# -----------------------------------------------------------------------------
-# Container App: tuya-bridge (split out for the env cycle break)
-# -----------------------------------------------------------------------------
-resource "azurerm_container_app" "tuya_bridge" {
-  name                         = "${local.azure_name_prefix}-tuya-bridge"
-  container_app_environment_id = azurerm_container_app_environment.main.id
-  resource_group_name          = var.resource_group_name
-  revision_mode                = "Single"
-  tags                         = var.tags
+module "service" {
+  source = "./service"
 
-  identity {
-    type         = "UserAssigned"
-    identity_ids = [azurerm_user_assigned_identity.services["tuya-bridge"].id]
+  for_each = {
+    for k, v in var.services :
+    k => v if !contains(["device-service", "tuya-bridge"], k)
   }
 
-  registry {
-    server   = var.registry_login_server
-    identity = azurerm_user_assigned_identity.services["tuya-bridge"].id
-  }
+  service_name = each.key
+  port         = each.value.port
+  cpu          = each.value.cpu
+  memory       = each.value.memory
+  image_url    = var.image_urls[each.key]
 
-  secret {
-    name                = "jwt-secret"
-    key_vault_secret_id = var.jwt_secret_id
-    identity            = azurerm_user_assigned_identity.services["tuya-bridge"].id
-  }
+  azure_name_prefix            = local.service_common.azure_name_prefix
+  environment                  = local.service_common.environment
+  log_level                    = local.service_common.log_level
+  resource_group_name          = local.service_common.resource_group_name
+  location                     = local.service_common.location
+  tags                         = local.service_common.tags
+  container_app_environment_id = local.service_common.container_app_environment_id
+  registry_id                  = local.service_common.registry_id
+  registry_login_server        = local.service_common.registry_login_server
+  min_instances                = local.service_common.min_instances
+  max_instances                = local.service_common.max_instances
 
-  secret {
-    name                = "internal-token"
-    key_vault_secret_id = var.internal_token_id
-    identity            = azurerm_user_assigned_identity.services["tuya-bridge"].id
-  }
+  db_host     = local.service_common.db_host
+  db_name     = local.service_common.db_name
+  db_username = local.service_common.db_username
+  db_password = local.service_common.db_password
 
-  ingress {
-    external_enabled           = true
-    target_port                = var.services["tuya-bridge"].port
-    transport                  = "http"
-    allow_insecure_connections = false
+  key_vault_url        = local.service_common.key_vault_url
+  jwt_secret_id        = local.service_common.jwt_secret_id
+  jwt_secret_scope     = local.service_common.jwt_secret_scope
+  internal_token_id    = local.service_common.internal_token_id
+  internal_token_scope = local.service_common.internal_token_scope
+  tuya_secret_id       = local.service_common.tuya_secret_id
+  tuya_secret_scope    = local.service_common.tuya_secret_scope
+  tuya_secret_name     = local.service_common.tuya_secret_name
+  tuya_device_ids      = local.service_common.tuya_device_ids
 
-    traffic_weight {
-      latest_revision = true
-      percentage      = 100
-    }
-  }
+  servicebus_namespace_fqdn = local.service_common.servicebus_namespace_fqdn
+  servicebus_queue_name     = local.service_common.servicebus_queue_name
+  servicebus_queue_id       = local.service_common.servicebus_queue_id
+  servicebus_dlq_name       = local.service_common.servicebus_dlq_name
 
-  template {
-    min_replicas = var.min_instances
-    max_replicas = var.max_instances
+  # analytics-service consumes Service Bus messages. automation + user
+  # don't touch it.
+  servicebus_role = each.key == "analytics-service" ? "receiver" : "none"
 
-    container {
-      name   = "tuyabridge"
-      image  = var.image_urls["tuya-bridge"]
-      cpu    = var.services["tuya-bridge"].cpu
-      memory = var.services["tuya-bridge"].memory
-
-      startup_probe {
-        path                    = "/health"
-        port                    = var.services["tuya-bridge"].port
-        transport               = "HTTP"
-        initial_delay           = 10
-        interval_seconds        = 10
-        timeout                 = 5
-        failure_count_threshold = 6
-      }
-
-      liveness_probe {
-        path                    = "/health"
-        port                    = var.services["tuya-bridge"].port
-        transport               = "HTTP"
-        interval_seconds        = 30
-        timeout                 = 5
-        failure_count_threshold = 3
-      }
-
-      dynamic "env" {
-        for_each = local.base_env
-        content {
-          name  = env.value.name
-          value = env.value.value
-        }
-      }
-
-      env {
-        name        = "JWT_SECRET"
-        secret_name = "jwt-secret"
-      }
-
-      env {
-        name        = "INTERNAL_TOKEN"
-        secret_name = "internal-token"
-      }
-
-      env {
-        name  = "SERVICE_NAME"
-        value = "tuya-bridge"
-      }
-
-      env {
-        name  = "PORT"
-        value = tostring(var.services["tuya-bridge"].port)
-      }
-
-      env {
-        name  = "AZURE_CLIENT_ID"
-        value = azurerm_user_assigned_identity.services["tuya-bridge"].client_id
-      }
-      # DEVICE_SERVICE_URL is added by null_resource.patch_tuya_bridge_url
-      # after device-service exists.
-    }
-  }
-
-  depends_on = [
-    azurerm_role_assignment.acr_pull,
-    azurerm_role_assignment.app_secrets,
-    azurerm_role_assignment.tuya_bridge_secret,
-  ]
-
-  lifecycle {
-    ignore_changes = [
-      # See module header: tuya-bridge env is patched after create.
-      # Future env changes need a `terraform taint null_resource.patch_tuya_bridge_url`.
-      template[0].container[0].env,
-    ]
-  }
+  # analytics-service queries device-service for live counts;
+  # automation-service issues device commands as part of /chase. The
+  # extra env on user-service is harmless — filtering it out would
+  # mean splitting the for_each further; not worth the readability cost.
+  device_service_url = module.device_service.url
 }
 
 # -----------------------------------------------------------------------------
 # Post-create patch: DEVICE_SERVICE_URL on tuya-bridge
 # -----------------------------------------------------------------------------
+# Mirrors the GCP module's parent-level patch. tuya-bridge is created
+# first (no cross-ref), device-service follows (consumes tuya_bridge.url),
+# then this null_resource patches DEVICE_SERVICE_URL onto tuya-bridge.
+#
+# Triggers on the tuya-bridge revision name so the patch re-runs after
+# any in-place update of tuya-bridge (image change, resource-limit
+# change). replace_triggered_by can't cross module boundaries from
+# parent scope; the revision name is the workaround.
 resource "null_resource" "patch_tuya_bridge_url" {
   triggers = {
-    tuya_bridge_name   = azurerm_container_app.tuya_bridge.name
-    device_service_url = "https://${azurerm_container_app.device_service.ingress[0].fqdn}"
-  }
-
-  lifecycle {
-    replace_triggered_by = [azurerm_container_app.tuya_bridge]
+    tuya_bridge_revision = module.tuya_bridge.latest_revision_name
+    device_service_url   = module.device_service.url
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       set -e
-      echo ">>> Patching DEVICE_SERVICE_URL on ${azurerm_container_app.tuya_bridge.name}"
+      echo ">>> Patching DEVICE_SERVICE_URL on ${module.tuya_bridge.container_app_name}"
       az containerapp update \
-        --name "${azurerm_container_app.tuya_bridge.name}" \
+        --name "${module.tuya_bridge.container_app_name}" \
         --resource-group "${var.resource_group_name}" \
-        --set-env-vars "DEVICE_SERVICE_URL=https://${azurerm_container_app.device_service.ingress[0].fqdn}" \
+        --set-env-vars "DEVICE_SERVICE_URL=${module.device_service.url}" \
         >/dev/null
     EOT
   }
