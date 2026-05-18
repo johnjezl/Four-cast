@@ -1,0 +1,70 @@
+# buildspec.yml  (repo root)
+# Four-cast Track B -- AWS CodeBuild build specification
+# Builds and pushes all five Docker images to Amazon ECR.
+# Produces imagedefinitions.json artifact for ECS deploy stage.
+
+version: 0.2
+
+env:
+  variables:
+    ENVIRONMENT: "dev"
+    ECS_CLUSTER: "smarthome-dev-cluster"
+    AWS_REGION: "us-east-1"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "CodeBuild environment ready"
+      - docker --version
+      - aws --version
+
+  pre_build:
+    commands:
+      - echo "Authenticating with Amazon ECR..."
+      - ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+      - IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-8)
+      - echo "Registry: ${ECR_REGISTRY} Tag: ${IMAGE_TAG}"
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+      - echo "ECR login successful"
+
+  build:
+    commands:
+      - echo "Building Docker images"
+      - |
+        SERVICES="device-service automation-service user-service analytics-service tuya-bridge"
+        for SERVICE in $SERVICES; do
+          REPO="${ECR_REGISTRY}/smarthome-${ENVIRONMENT}-${SERVICE}"
+          echo "==> Building ${SERVICE}"
+          docker build -t "${REPO}:${IMAGE_TAG}" -t "${REPO}:latest" -f "aws/services/${SERVICE}/Dockerfile" .
+          docker push "${REPO}:${IMAGE_TAG}"
+          docker push "${REPO}:latest"
+          echo "Pushed: ${REPO}:${IMAGE_TAG}"
+        done
+      - echo "All images pushed successfully."
+
+  post_build:
+    commands:
+      - echo "Generating imagedefinitions.json"
+      - |
+        SERVICES="device-service automation-service user-service analytics-service tuya-bridge"
+        printf "[" > imagedefinitions.json
+        FIRST=true
+        for SERVICE in $SERVICES; do
+          REPO="${ECR_REGISTRY}/smarthome-${ENVIRONMENT}-${SERVICE}"
+          if [ "$FIRST" = "true" ]; then FIRST=false; else printf "," >> imagedefinitions.json; fi
+          printf '{"name":"%s","imageUri":"%s"}' "$SERVICE" "${REPO}:${IMAGE_TAG}" >> imagedefinitions.json
+        done
+        printf "]" >> imagedefinitions.json
+      - cat imagedefinitions.json
+      - echo "Build complete. Commit: ${CODEBUILD_RESOLVED_SOURCE_VERSION}"
+
+artifacts:
+  files:
+    - imagedefinitions.json
+
+cache:
+  paths:
+    - "/root/.docker/layers/**/*"
