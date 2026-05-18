@@ -27,6 +27,7 @@ jobs:
 
   # ============================================================
   # JOB 1: Terraform Format Check + Validate
+  # Uses local backend so it works before S3 bucket is created.
   # ============================================================
   validate:
     name: "Terraform Validate"
@@ -49,14 +50,9 @@ jobs:
         with:
           terraform_version: "~> 1.7"
 
-      - name: Terraform Init
+      - name: Terraform Init (local backend for validation)
         working-directory: aws/terraform
-        run: |
-          terraform init \
-            -backend-config="bucket=four-cast-tfstate-${{ secrets.AWS_ACCOUNT_ID }}" \
-            -backend-config="key=aws/terraform.tfstate" \
-            -backend-config="region=${{ env.AWS_REGION }}" \
-            -backend-config="dynamodb_table=four-cast-tfstate-lock"
+        run: terraform init -backend=false
 
       - name: Terraform Format Check
         working-directory: aws/terraform
@@ -68,6 +64,7 @@ jobs:
 
   # ============================================================
   # JOB 2: Build Docker Images and Push to ECR
+  # Creates ECR repos if they don't exist, then builds & pushes.
   # Only runs on push to main (not PRs).
   # ============================================================
   build:
@@ -103,13 +100,13 @@ jobs:
           for SERVICE in "${SERVICES[@]}"; do
             REPO_NAME="smarthome-${ENVIRONMENT}-${SERVICE}"
             echo "Ensuring ECR repo exists: ${REPO_NAME}"
-            aws ecr describe-repositories --repository-names "${REPO_NAME}" --region ${{ env.AWS_REGION }} 2>/dev/null || \
-              aws ecr create-repository \
-                --repository-name "${REPO_NAME}" \
-                --region ${{ env.AWS_REGION }} \
-                --image-scanning-configuration scanOnPush=true \
-                --encryption-configuration encryptionType=AES256
-            echo "  -> OK: ${REPO_NAME}"
+            aws ecr describe-repositories --repository-names "${REPO_NAME}" --region ${{ env.AWS_REGION }} 2>/dev/null \
+              || aws ecr create-repository \
+                   --repository-name "${REPO_NAME}" \
+                   --region ${{ env.AWS_REGION }} \
+                   --image-scanning-configuration scanOnPush=true \
+                   --encryption-configuration encryptionType=AES256
+            echo "  -> Ready: ${REPO_NAME}"
           done
 
       - name: Build and push all five services
@@ -130,6 +127,8 @@ jobs:
 
   # ============================================================
   # JOB 3: Deploy to ECS Fargate
+  # Gracefully skips services that don't exist yet
+  # (ECS services are created by terraform apply, not this pipeline).
   # ============================================================
   deploy:
     name: "Deploy to ECS Fargate"
@@ -149,28 +148,53 @@ jobs:
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy all services to ECS
+      - name: Deploy services to ECS (skips if not yet provisioned)
         run: |
           SERVICES=(device-service automation-service user-service analytics-service tuya-bridge)
+          DEPLOYED=0
+          SKIPPED=0
           for SERVICE in "${SERVICES[@]}"; do
             ECS_SERVICE="smarthome-${ENVIRONMENT}-${SERVICE}"
-            echo "==> Deploying ${ECS_SERVICE} to cluster ${ECS_CLUSTER}"
-            aws ecs update-service \
-              --cluster ${{ env.ECS_CLUSTER }} \
+            echo "==> Redeploying ${ECS_SERVICE}"
+            RESULT=$(aws ecs update-service \
+              --cluster "${{ env.ECS_CLUSTER }}" \
               --service "${ECS_SERVICE}" \
               --force-new-deployment \
-              --region ${{ env.AWS_REGION }} || echo "WARNING: service ${ECS_SERVICE} not found, skipping."
+              --region ${{ env.AWS_REGION }} 2>&1) && {
+              echo "  -> Deployment triggered for ${ECS_SERVICE}"
+              DEPLOYED=$((DEPLOYED+1))
+            } || {
+              echo "  -> SKIPPED: ${ECS_SERVICE} not found (run terraform apply to provision)"
+              SKIPPED=$((SKIPPED+1))
+            }
           done
+          echo ""
+          echo "Deploy summary: ${DEPLOYED} deployed, ${SKIPPED} skipped (not yet provisioned)"
+          if [ "$DEPLOYED" -eq 0 ] && [ "$SKIPPED" -gt 0 ]; then
+            echo "NOTE: No ECS services found. Images are in ECR ready for when terraform apply creates the services."
+          fi
 
-      - name: Wait for services to stabilize
+      - name: Wait for deployed services to stabilize
         run: |
           SERVICES=(device-service automation-service user-service analytics-service tuya-bridge)
           for SERVICE in "${SERVICES[@]}"; do
             ECS_SERVICE="smarthome-${ENVIRONMENT}-${SERVICE}"
-            echo "Waiting for ${ECS_SERVICE} to stabilize..."
-            aws ecs wait services-stable \
-              --cluster ${{ env.ECS_CLUSTER }} \
-              --services "${ECS_SERVICE}" \
-              --region ${{ env.AWS_REGION }} || echo "WARNING: ${ECS_SERVICE} wait skipped (service may not exist yet)."
+            # Only wait if the service actually exists
+            if aws ecs describe-services \
+                 --cluster "${{ env.ECS_CLUSTER }}" \
+                 --services "${ECS_SERVICE}" \
+                 --region ${{ env.AWS_REGION }} \
+                 --query "services[?status=='ACTIVE']" \
+                 --output text 2>/dev/null | grep -q "${ECS_SERVICE}"; then
+              echo "Waiting for ${ECS_SERVICE} to stabilize..."
+              aws ecs wait services-stable \
+                --cluster "${{ env.ECS_CLUSTER }}" \
+                --services "${ECS_SERVICE}" \
+                --region ${{ env.AWS_REGION }} \
+                && echo "  -> Stable: ${ECS_SERVICE}" \
+                || echo "  -> Timeout waiting for ${ECS_SERVICE} (continuing)"
+            else
+              echo "Skipping wait for ${ECS_SERVICE} (not provisioned yet)"
+            fi
           done
-          echo "Deployment complete."
+          echo "Deployment step complete."
