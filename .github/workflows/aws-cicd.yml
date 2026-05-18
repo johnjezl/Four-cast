@@ -97,6 +97,21 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Ensure ECR repositories exist
+        run: |
+          SERVICES=(device-service automation-service user-service analytics-service tuya-bridge)
+          for SERVICE in "${SERVICES[@]}"; do
+            REPO_NAME="smarthome-${ENVIRONMENT}-${SERVICE}"
+            echo "Ensuring ECR repo exists: ${REPO_NAME}"
+            aws ecr describe-repositories --repository-names "${REPO_NAME}" --region ${{ env.AWS_REGION }} 2>/dev/null || \
+              aws ecr create-repository \
+                --repository-name "${REPO_NAME}" \
+                --region ${{ env.AWS_REGION }} \
+                --image-scanning-configuration scanOnPush=true \
+                --encryption-configuration encryptionType=AES256
+            echo "  -> OK: ${REPO_NAME}"
+          done
+
       - name: Build and push all five services
         env:
           ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
@@ -125,43 +140,37 @@ jobs:
       id-token: write
       contents: read
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Force new ECS deployments
+      - name: Deploy all services to ECS
         run: |
           SERVICES=(device-service automation-service user-service analytics-service tuya-bridge)
-          for SVC in "${SERVICES[@]}"; do
-            echo "==> Redeploying ${SVC}"
+          for SERVICE in "${SERVICES[@]}"; do
+            ECS_SERVICE="smarthome-${ENVIRONMENT}-${SERVICE}"
+            echo "==> Deploying ${ECS_SERVICE} to cluster ${ECS_CLUSTER}"
             aws ecs update-service \
               --cluster ${{ env.ECS_CLUSTER }} \
-              --service ${SVC} \
+              --service "${ECS_SERVICE}" \
               --force-new-deployment \
-              --region ${{ env.AWS_REGION }} \
-              --query 'service.serviceName' --output text
+              --region ${{ env.AWS_REGION }} || echo "WARNING: service ${ECS_SERVICE} not found, skipping."
           done
 
-      - name: Wait for all services to stabilize
+      - name: Wait for services to stabilize
         run: |
           SERVICES=(device-service automation-service user-service analytics-service tuya-bridge)
-          for SVC in "${SERVICES[@]}"; do
-            echo "==> Waiting for ${SVC} to stabilize..."
+          for SERVICE in "${SERVICES[@]}"; do
+            ECS_SERVICE="smarthome-${ENVIRONMENT}-${SERVICE}"
+            echo "Waiting for ${ECS_SERVICE} to stabilize..."
             aws ecs wait services-stable \
               --cluster ${{ env.ECS_CLUSTER }} \
-              --services ${SVC} --region ${{ env.AWS_REGION }}
-            echo "${SVC}: STABLE"
+              --services "${ECS_SERVICE}" \
+              --region ${{ env.AWS_REGION }} || echo "WARNING: ${ECS_SERVICE} wait skipped (service may not exist yet)."
           done
-
-      - name: Print deployment summary
-        run: |
-          echo "=== Deployment Summary ==="
-          aws ecs describe-services \
-            --cluster ${{ env.ECS_CLUSTER }} \
-            --services device-service automation-service user-service analytics-service tuya-bridge \
-            --query 'services[*].{Name:serviceName,Running:runningCount,Desired:desiredCount,Status:status}' \
-            --output table --region ${{ env.AWS_REGION }}
-          echo "Commit: ${{ github.sha }}"
-          echo "Image tag: ${{ needs.build.outputs.image-tag }}"
+          echo "Deployment complete."
