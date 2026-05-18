@@ -51,6 +51,15 @@ Resources:
                 Effect: Allow
                 Action: ecr:GetAuthorizationToken
                 Resource: "*"
+              - Sid: ECRManage
+                Effect: Allow
+                Action:
+                  - ecr:CreateRepository
+                  - ecr:DescribeRepositories
+                  - ecr:DeleteRepository
+                  - ecr:TagResource
+                  - ecr:ListTagsForResource
+                Resource: !Sub "arn:aws:ecr:*:${AWS::AccountId}:repository/smarthome-*"
               - Sid: ECRPushPull
                 Effect: Allow
                 Action:
@@ -61,7 +70,6 @@ Resources:
                   - ecr:UploadLayerPart
                   - ecr:CompleteLayerUpload
                   - ecr:PutImage
-                  - ecr:DescribeRepositories
                   - ecr:DescribeImages
                 Resource: !Sub "arn:aws:ecr:*:${AWS::AccountId}:repository/smarthome-*"
         - PolicyName: FourCastECSPolicy
