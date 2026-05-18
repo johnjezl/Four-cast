@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "GitHub Actions OIDC provider and IAM role for johnjezl/Four-cast CI/CD"
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Default: johnjezl
+    Description: "GitHub username owning the repository"
+  GitHubRepo:
+    Type: String
+    Default: Four-cast
+    Description: "GitHub repository name"
+
+Resources:
+
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: four-cast-github-actions-role
+      Description: "Role assumed by GitHub Actions for johnjezl/Four-cast CI/CD"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOIDCProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  !Sub "repo:${GitHubOrg}/${GitHubRepo}:*"
+      Policies:
+        - PolicyName: FourCastECRPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ECRAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: ECRPushPull
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:DescribeRepositories
+                  - ecr:DescribeImages
+                Resource: !Sub "arn:aws:ecr:*:${AWS::AccountId}:repository/smarthome-*"
+        - PolicyName: FourCastECSPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ECSRedeploy
+                Effect: Allow
+                Action:
+                  - ecs:UpdateService
+                  - ecs:DescribeServices
+                  - ecs:DescribeClusters
+                  - ecs:DescribeTaskDefinition
+                  - ecs:ListServices
+                  - ecs:ListTasks
+                  - ecs:DescribeTasks
+                Resource: "*"
+              - Sid: IAMPassRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/smarthome-*"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+        - PolicyName: FourCastTerraformPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: TerraformState
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub "arn:aws:s3:::four-cast-tfstate-${AWS::AccountId}"
+                  - !Sub "arn:aws:s3:::four-cast-tfstate-${AWS::AccountId}/*"
+              - Sid: TerraformLock
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                Resource: !Sub "arn:aws:dynamodb:*:${AWS::AccountId}:table/four-cast-tfstate-lock"
+
+Outputs:
+  RoleArn:
+    Description: "ARN to set as GitHub secret AWS_OIDC_ROLE_ARN"
+    Value: !GetAtt GitHubActionsRole.Arn
+    Export:
+      Name: FourCast-GitHubActionsRoleArn
+  OIDCProviderArn:
+    Value: !Ref GitHubOIDCProvider
